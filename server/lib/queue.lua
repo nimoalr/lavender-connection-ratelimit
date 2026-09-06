@@ -3,8 +3,32 @@ Lavender = Lavender or {}
 local Identity = Lavender.Identity
 local Util = Lavender.Util
 
-local Queue = {}
-Queue.__index = Queue
+--[[
+    Admission queue.
+
+    All queue work runs synchronously on the server's main thread, so every
+    operation must stay cheap at large backlogs (hundreds to thousands of
+    waiting connections):
+
+      * Identity lookups (queued duplicates, in-flight duplicates, recent-admission
+        cooldowns) go through an exact inverted index (identifier -> members).
+        Identity.matches(a, b, t) with the validated threshold t >= 0.01 requires
+        at least one shared identifier, so the index enumerates a superset of every
+        match and the same Jaccard predicate is then applied to candidates only.
+        Unique identities cost O(1) instead of a full scan per entry.
+      * One reconciliation pass computes each entry's wait estimate for later
+        duplicates in O(log n) using a sorted prefix of eligibility times, instead
+        of an O(n) rescan per duplicate.
+      * Batch expiry and drain remove every affected entry first and reconcile
+        ONCE, instead of reconciling after each single removal (which is cubic in
+        the batch size).
+      * Observer callbacks (onEvent) are isolated: an exception in a metrics
+        callback cannot abort a state transition half-way or kill the caller's
+        ticker. Failures are counted, never swallowed silently.
+
+    When several in-flight entries match, the one with the lowest sourceKey
+    (string order) is chosen so results are deterministic.
+]]
 
 local function copyArray(source)
     local copy = {}
@@ -13,6 +37,103 @@ local function copyArray(source)
     end
     return copy
 end
+
+-- ---------------------------------------------------------------------------
+-- Exact inverted identity index
+-- ---------------------------------------------------------------------------
+
+local IdentityIndex = {}
+IdentityIndex.__index = IdentityIndex
+
+function IdentityIndex.new()
+    return setmetatable({ members = {} }, IdentityIndex)
+end
+
+function IdentityIndex:add(record, identitySet)
+    for identifier in pairs(identitySet or {}) do
+        local bucket = self.members[identifier]
+        if not bucket then
+            bucket = {}
+            self.members[identifier] = bucket
+        end
+        bucket[record] = true
+    end
+end
+
+function IdentityIndex:remove(record, identitySet)
+    for identifier in pairs(identitySet or {}) do
+        local bucket = self.members[identifier]
+        if bucket then
+            bucket[record] = nil
+            if next(bucket) == nil then
+                self.members[identifier] = nil
+            end
+        end
+    end
+end
+
+--- candidates returns a set of records sharing at least one identifier with
+--- identitySet. Every record that can satisfy Identity.matches with a positive
+--- threshold is in this set; callers still apply the exact predicate.
+function IdentityIndex:candidates(identitySet)
+    local found = {}
+    for identifier in pairs(identitySet or {}) do
+        local bucket = self.members[identifier]
+        if bucket then
+            for record in pairs(bucket) do
+                found[record] = true
+            end
+        end
+    end
+    return found
+end
+
+-- ---------------------------------------------------------------------------
+-- Sorted prefix of eligibility times (per reconciliation pass)
+-- ---------------------------------------------------------------------------
+
+-- countAtMost returns how many values in the sorted array are <= x.
+local function countAtMost(sorted, x)
+    local lo, hi = 1, #sorted
+    while lo <= hi do
+        local mid = (lo + hi) // 2
+        if sorted[mid] <= x then
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return lo - 1
+end
+
+local function insertSorted(sorted, x)
+    local lo, hi = 1, #sorted
+    while lo <= hi do
+        local mid = (lo + hi) // 2
+        if sorted[mid] <= x then
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    table.insert(sorted, lo, x)
+end
+
+local function sortedKeys(set)
+    local keys = {}
+    for key in pairs(set) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    return keys
+end
+
+-- ---------------------------------------------------------------------------
+-- Queue
+-- ---------------------------------------------------------------------------
+
+local Queue = {}
+Queue.__index = Queue
 
 function Queue.new(options)
     options = options or {}
@@ -31,6 +152,13 @@ function Queue.new(options)
         nextId = 0,
         tokens = config.release.burst,
         lastRefill = current,
+        -- indexes (exact; see header)
+        queuedIndex = IdentityIndex.new(),
+        inFlightIndex = IdentityIndex.new(),
+        recentIndex = IdentityIndex.new(),
+        -- observer isolation
+        eventCallbackErrors = 0,
+        lastEventCallbackError = nil,
     }, Queue)
 end
 
@@ -45,8 +173,15 @@ function Queue:fillBucket()
     self.lastRefill = self.now()
 end
 
+--- _emit notifies the observer. The observer is OUTSIDE the queue's invariants:
+--- a throwing callback must not leave an entry half admitted, so failures are
+--- counted and reported, and state transitions always complete.
 function Queue:_emit(event, data)
-    self.onEvent(event, data)
+    local ok, err = pcall(self.onEvent, event, data)
+    if not ok then
+        self.eventCallbackErrors = self.eventCallbackErrors + 1
+        self.lastEventCallbackError = tostring(err)
+    end
 end
 
 function Queue:_refill()
@@ -77,20 +212,47 @@ end
 
 function Queue:_cleanupRecent(now)
     for i = #self.recentAdmissions, 1, -1 do
-        if self.recentAdmissions[i].expiresAt <= now then
+        local recent = self.recentAdmissions[i]
+        if recent.expiresAt <= now then
             table.remove(self.recentAdmissions, i)
+            self.recentIndex:remove(recent, recent.identitySet)
         end
     end
+end
 
+--- _matchingInFlightFor returns the in-flight entry matching identitySet (or, when
+--- sourceKey is given, sharing that sourceKey) with the lowest sourceKey, or nil.
+function Queue:_matchingInFlightFor(identitySet, sourceKey)
+    local threshold = self.config.identity.similarityThreshold
+    local candidates = self.inFlightIndex:candidates(identitySet)
+    local matching = {}
+    for record in pairs(candidates) do
+        if Identity.matches(identitySet, record.identitySet, threshold) then
+            matching[record.sourceKey] = record
+        end
+    end
+    if sourceKey ~= nil and self.inFlight[sourceKey] then
+        matching[sourceKey] = self.inFlight[sourceKey]
+    end
+    local keys = sortedKeys(matching)
+    if #keys == 0 then
+        return nil
+    end
+    return matching[keys[1]]
 end
 
 function Queue:_activeDuplicateInfo(candidate, now)
     local threshold = self.config.identity.similarityThreshold
+    local identitySet = candidate.identitySet or {}
+    local candidates = self.queuedIndex:candidates(identitySet)
 
+    -- Latest queued entry (highest position) that matches by identity or shares
+    -- the sourceKey: same result as the original reverse scan, but only the
+    -- candidate subset pays the Jaccard comparison.
     for i = #self.entries, 1, -1 do
         local existing = self.entries[i]
         if existing.sourceKey == candidate.sourceKey
-            or Identity.matches(candidate.identitySet, existing.identitySet, threshold) then
+            or (candidates[existing] and Identity.matches(identitySet, existing.identitySet, threshold)) then
             return {
                 state = 'queued',
                 entry = existing,
@@ -103,15 +265,13 @@ function Queue:_activeDuplicateInfo(candidate, now)
         end
     end
 
-    for _, existing in pairs(self.inFlight) do
-        if existing.sourceKey == candidate.sourceKey
-            or Identity.matches(candidate.identitySet, existing.identitySet, threshold) then
-            return {
-                state = 'joining',
-                entry = existing,
-                waitSeconds = math.max(0, existing.expiresAt - now),
-            }
-        end
+    local joining = self:_matchingInFlightFor(identitySet, candidate.sourceKey)
+    if joining then
+        return {
+            state = 'joining',
+            entry = joining,
+            waitSeconds = math.max(0, joining.expiresAt - now),
+        }
     end
 
     return nil
@@ -124,9 +284,10 @@ function Queue:_nearestQueuedDuplicateBefore(index)
     end
 
     local threshold = self.config.identity.similarityThreshold
+    local candidates = self.queuedIndex:candidates(entry.identitySet)
     for i = index - 1, 1, -1 do
         local existing = self.entries[i]
-        if Identity.matches(entry.identitySet, existing.identitySet, threshold) then
+        if candidates[existing] and Identity.matches(entry.identitySet, existing.identitySet, threshold) then
             return existing
         end
     end
@@ -135,16 +296,15 @@ function Queue:_nearestQueuedDuplicateBefore(index)
 end
 
 function Queue:_matchingInFlight(entry)
-    local threshold = self.config.identity.similarityThreshold
-    for _, existing in pairs(self.inFlight) do
-        if Identity.matches(entry.identitySet, existing.identitySet, threshold) then
-            return existing
-        end
-    end
-
-    return nil
+    return self:_matchingInFlightFor(entry.identitySet, nil)
 end
 
+--- _reconcileActiveDuplicateDelays recomputes user-level eligibility for every
+--- queued entry in queue order. For an entry with an earlier queued duplicate the
+--- original called estimateWait(duplicate), which rescans everything ahead of the
+--- duplicate; because entries ahead of the duplicate are already final within
+--- this pass, that estimate is precomputed here when the duplicate itself is
+--- processed (sorted prefix of eligibility times + binary search).
 function Queue:_reconcileActiveDuplicateDelays(now)
     if self.config.identity.activeDuplicatePolicy ~= 'queue' then
         return
@@ -152,17 +312,35 @@ function Queue:_reconcileActiveDuplicateDelays(now)
 
     now = now or self.now()
 
+    local threshold = self.config.identity.similarityThreshold
+    local cooldownSeconds = self.config.identity.userCooldownSeconds
+    local rate = self.config.release.ratePerSecond
+
+    local position = {}      -- entry -> index, for entries already processed
+    local prefixEligible = {} -- sorted max(userEligibleAt, ipEligibleAt) of processed entries
+    local estimate = {}      -- entry -> estimateWait(entry) as the original would compute it
+
     for i = 1, #self.entries do
         local entry = self.entries[i]
         local userEligibleAt = self:_recentCooldownUntil(entry.identitySet or {}, now)
         local userDelayReason
         local duplicateState
 
-        local queuedDuplicate = self:_nearestQueuedDuplicateBefore(i)
+        -- nearest earlier duplicate: the candidate with the highest processed index
+        local queuedDuplicate
+        local bestIndex = 0
+        for record in pairs(self.queuedIndex:candidates(entry.identitySet)) do
+            local idx = position[record]
+            if idx and idx > bestIndex and Identity.matches(entry.identitySet, record.identitySet, threshold) then
+                bestIndex = idx
+                queuedDuplicate = record
+            end
+        end
+
         if queuedDuplicate then
             userEligibleAt = math.max(
                 userEligibleAt,
-                now + self:estimateWait(queuedDuplicate) + self.config.identity.userCooldownSeconds
+                now + estimate[queuedDuplicate] + cooldownSeconds
             )
             userDelayReason = 'active_duplicate'
             duplicateState = 'queued'
@@ -171,7 +349,7 @@ function Queue:_reconcileActiveDuplicateDelays(now)
             if joiningDuplicate then
                 userEligibleAt = math.max(
                     userEligibleAt,
-                    (joiningDuplicate.admittedAt or now) + self.config.identity.userCooldownSeconds
+                    (joiningDuplicate.admittedAt or now) + cooldownSeconds
                 )
                 userDelayReason = 'active_duplicate'
                 duplicateState = 'joining'
@@ -181,6 +359,15 @@ function Queue:_reconcileActiveDuplicateDelays(now)
         entry.userEligibleAt = userEligibleAt
         entry.userDelayReason = userDelayReason
         entry.duplicateState = duplicateState
+
+        -- estimateWait(entry) restricted to entries ahead of it, all final now.
+        local eligibleAt = math.max(now, entry.userEligibleAt, entry.ipEligibleAt)
+        local ahead = countAtMost(prefixEligible, eligibleAt)
+        local tokenDelay = math.max(0, (ahead + 1) - self:_tokensAt(eligibleAt)) / rate
+        estimate[entry] = (eligibleAt - now) + tokenDelay
+
+        insertSorted(prefixEligible, math.max(entry.userEligibleAt, entry.ipEligibleAt))
+        position[entry] = i
     end
 end
 
@@ -221,8 +408,7 @@ function Queue:_recentCooldownUntil(identitySet, now)
     local cooldownUntil = now
     local threshold = self.config.identity.similarityThreshold
 
-    for i = 1, #self.recentAdmissions do
-        local recent = self.recentAdmissions[i]
+    for recent in pairs(self.recentIndex:candidates(identitySet)) do
         if Identity.matches(identitySet, recent.identitySet, threshold) then
             cooldownUntil = math.max(cooldownUntil, recent.admittedAt + self.config.identity.userCooldownSeconds)
         end
@@ -279,21 +465,53 @@ function Queue:enqueue(candidate)
 
     self.entries[#self.entries + 1] = entry
     self.entriesById[entry.id] = entry
+    self.queuedIndex:add(entry, entry.identitySet)
     self:_reconcileDelays(now)
     self:_emit('queued', entry)
     return entry
 end
 
-function Queue:_removeAt(index, reason)
+--- _detach removes the entry at index from the queue structures WITHOUT
+--- reconciling or emitting; callers batch those steps.
+function Queue:_detach(index)
     local entry = table.remove(self.entries, index)
     if not entry then
         return nil
     end
-
     self.entriesById[entry.id] = nil
+    self.queuedIndex:remove(entry, entry.identitySet)
+    return entry
+end
+
+function Queue:_removeAt(index, reason)
+    local entry = self:_detach(index)
+    if not entry then
+        return nil
+    end
+
     self:_reconcileDelays(self.now())
     self:_emit('removed', { entry = entry, reason = reason })
     return entry
+end
+
+--- _removeMany detaches the entries at the given DESCENDING indices, reconciles
+--- once, then emits one 'removed' event per entry in that order (the order the
+--- original produced by removing one at a time from the back).
+function Queue:_removeMany(indicesDescending, reason)
+    local removed = {}
+    for i = 1, #indicesDescending do
+        local entry = self:_detach(indicesDescending[i])
+        if entry then
+            removed[#removed + 1] = entry
+        end
+    end
+    if #removed > 0 then
+        self:_reconcileDelays(self.now())
+        for i = 1, #removed do
+            self:_emit('removed', { entry = removed[i], reason = reason })
+        end
+    end
+    return removed
 end
 
 function Queue:remove(sourceKey, reason)
@@ -336,21 +554,47 @@ function Queue:_timeEligible(entry, now)
 end
 
 function Queue:_expireQueue(now, results)
+    local expired = {}
     for i = #self.entries, 1, -1 do
-        local entry = self.entries[i]
-        if now - entry.enqueuedAt >= self.config.queue.maxWaitSeconds then
-            results.queueTimeouts[#results.queueTimeouts + 1] = self:_removeAt(i, 'queue_timeout')
+        if now - self.entries[i].enqueuedAt >= self.config.queue.maxWaitSeconds then
+            expired[#expired + 1] = i
         end
+    end
+    if #expired == 0 then
+        return
+    end
+    local removed = self:_removeMany(expired, 'queue_timeout')
+    for i = 1, #removed do
+        results.queueTimeouts[#results.queueTimeouts + 1] = removed[i]
     end
 end
 
+function Queue:_setInFlight(entry)
+    self.inFlight[entry.sourceKey] = entry
+    self.inFlightIndex:add(entry, entry.identitySet)
+end
+
+function Queue:_clearInFlight(sourceKey)
+    local entry = self.inFlight[sourceKey]
+    if entry then
+        self.inFlight[sourceKey] = nil
+        self.inFlightIndex:remove(entry, entry.identitySet)
+    end
+    return entry
+end
+
 function Queue:_expireInFlight(now, results)
+    local expired = {}
     for sourceKey, entry in pairs(self.inFlight) do
         if entry.expiresAt <= now then
-            self.inFlight[sourceKey] = nil
-            results.inFlightTimeouts[#results.inFlightTimeouts + 1] = entry
-            self:_emit('in_flight_timeout', entry)
+            expired[#expired + 1] = sourceKey
         end
+    end
+    table.sort(expired)
+    for i = 1, #expired do
+        local entry = self:_clearInFlight(expired[i])
+        results.inFlightTimeouts[#results.inFlightTimeouts + 1] = entry
+        self:_emit('in_flight_timeout', entry)
     end
 end
 
@@ -376,7 +620,7 @@ function Queue:updateInFlightPresence(sourceKey, present)
     local now = self.now()
     entry.missingSince = entry.missingSince or now
     if now - entry.missingSince >= self.config.queue.disconnectGraceSeconds then
-        self.inFlight[sourceKey] = nil
+        self:_clearInFlight(sourceKey)
         self:_emit('in_flight_disconnected', entry)
         return entry
     end
@@ -410,20 +654,21 @@ function Queue:tick()
             break
         end
 
-        local entry = table.remove(self.entries, eligibleIndex)
-        self.entriesById[entry.id] = nil
+        local entry = self:_detach(eligibleIndex)
         self.tokens = self.tokens - 1
 
         entry.admittedAt = now
         entry.expiresAt = now + self.config.release.inFlightTimeoutSeconds
         entry.missingSince = nil
-        self.inFlight[entry.sourceKey] = entry
-        self.recentAdmissions[#self.recentAdmissions + 1] = {
+        self:_setInFlight(entry)
+        local recent = {
             identitySet = entry.identitySet,
             ip = entry.ip,
             admittedAt = now,
             expiresAt = now + self.config.identity.recentHistorySeconds,
         }
+        self.recentAdmissions[#self.recentAdmissions + 1] = recent
+        self.recentIndex:add(recent, recent.identitySet)
 
         results.admitted[#results.admitted + 1] = entry
         self:_emit('admitted', entry)
@@ -437,20 +682,19 @@ function Queue:tick()
 end
 
 function Queue:completeInFlight(sourceKey)
-    local entry = self.inFlight[sourceKey]
+    local entry = self:_clearInFlight(sourceKey)
     if entry then
-        self.inFlight[sourceKey] = nil
         self:_emit('in_flight_completed', entry)
     end
     return entry
 end
 
 function Queue:drain(reason)
-    local drained = {}
-    while #self.entries > 0 do
-        drained[#drained + 1] = self:_removeAt(#self.entries, reason or 'resource_stop')
+    local indices = {}
+    for i = #self.entries, 1, -1 do
+        indices[#indices + 1] = i
     end
-    return drained
+    return self:_removeMany(indices, reason or 'resource_stop')
 end
 
 function Queue:getEntries()
@@ -529,6 +773,7 @@ function Queue:status()
         tokens = self.tokens,
         ratePerSecond = self.config.release.ratePerSecond,
         maxInFlight = self.config.release.maxInFlight,
+        eventCallbackErrors = self.eventCallbackErrors,
     }
 end
 

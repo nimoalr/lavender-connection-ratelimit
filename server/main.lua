@@ -43,6 +43,22 @@ local metrics = Metrics.new(activeConfig)
 local queue
 local firstConfigApply = true
 
+-- Operator-owned enable switch. A console `stop` is not durable: an `ensure`
+-- line in server.cfg starts the limiter again at every server restart. With
+-- `set lavender_enabled "false"` the resource starts INERT: it registers no
+-- connection handlers and no ticker, but still serves /metrics with enabled=0 so
+-- the state is observable. Default true.
+local function readEnabledConvar()
+    local ok, value = pcall(GetConvar, 'lavender_enabled', 'true')
+    if not ok or type(value) ~= 'string' then
+        return true
+    end
+    value = value:lower():match('^%s*(.-)%s*$')
+    return not (value == 'false' or value == '0' or value == 'no' or value == 'off')
+end
+local limiterEnabled = readEnabledConvar()
+metrics:setEnabled(limiterEnabled)
+
 queue = Queue.new({
     now = nowSeconds,
     config = activeConfig,
@@ -83,6 +99,21 @@ if not loaded then
 else
     log('Loaded config.lua.')
 end
+
+-- Log the EFFECTIVE non-secret settings at start. Runtime edits only log which
+-- key changed, so without this line a log review cannot tell what rate, burst,
+-- cap or queue policy was actually in force.
+local function logEffectiveSettings()
+    local r, q, i, ip, pw = activeConfig.release, activeConfig.queue, activeConfig.identity, activeConfig.ip, activeConfig.password
+    log(('Effective settings: enabled=%s release{rate=%s burst=%s maxInFlight=%s inFlightTimeout=%s} queue{maxSize=%s maxWait=%s disconnectGrace=%s} identity{policy=%s threshold=%s cooldown=%s history=%s} ip{spacing=%s} password{enabled=%s timeout=%s attempts=%s}'):format(
+        tostring(limiterEnabled),
+        tostring(r.ratePerSecond), tostring(r.burst), tostring(r.maxInFlight), tostring(r.inFlightTimeoutSeconds),
+        tostring(q.maxSize), tostring(q.maxWaitSeconds), tostring(q.disconnectGraceSeconds),
+        tostring(i.activeDuplicatePolicy), tostring(i.similarityThreshold), tostring(i.userCooldownSeconds), tostring(i.recentHistorySeconds),
+        tostring(ip.spacingSeconds),
+        tostring(pw.enabled), tostring(pw.timeoutSeconds), tostring(pw.maxAttempts)))
+end
+logEffectiveSettings()
 
 local function safePlayerIdentifiers(sourceKey)
     local ok, identifiers = pcall(GetPlayerIdentifiers, sourceKey)
@@ -142,6 +173,15 @@ local function sourceStillConnected(sourceKey)
     end
 
     return #safePlayerIdentifiers(sourceKey) > 0
+end
+
+-- presenceProbe reports WHICH presence predicates hold, for the password-gate
+-- diagnostics. Booleans only; never the values.
+local function presenceProbe(sourceKey)
+    return ('endpoint=%s name=%s identifiers=%s'):format(
+        tostring(safePlayerEndpoint(sourceKey) ~= nil),
+        tostring(safePlayerName(sourceKey) ~= nil),
+        tostring(#safePlayerIdentifiers(sourceKey) > 0))
 end
 
 local function runtimeCardStats()
@@ -253,6 +293,7 @@ local function promptForPassword(state, sourceKey)
         end
 
         local deadline = nowSeconds() + passwordConfig.timeoutSeconds
+        local promptedAt = nowSeconds()
         -- Other deferring resources (txAdmin's banlist check, for example) share
         -- the deferral display and can replace this card with their own text.
         -- Re-present on a backoff: quickly at first while other resources are
@@ -260,8 +301,17 @@ local function promptForPassword(state, sourceKey)
         local representInterval = 3
         local nextRepresentAt = nowSeconds() + representInterval
         while submitted == nil do
-            if state.closed or not sourceStillConnected(sourceKey) then
-                return false, 'disconnected', activeConfig.messages.disconnected
+            if state.closed then
+                log(('Password gate: deferral closed after %.1fs (attempt=%d)'):format(nowSeconds() - promptedAt, attempt))
+                return false, 'disconnected_deferral_closed', activeConfig.messages.disconnected
+            end
+            if not sourceStillConnected(sourceKey) then
+                -- Which predicate failed, and how long after the prompt, separates
+                -- the possible causes (natives empty for temporary IDs / server idle
+                -- timeout / genuine client departure). Booleans only.
+                log(('Password gate: source no longer present after %.1fs (attempt=%d %s)'):format(
+                    nowSeconds() - promptedAt, attempt, presenceProbe(sourceKey)))
+                return false, 'disconnected_endpoint_missing', activeConfig.messages.disconnected
             end
             if nowSeconds() >= deadline then
                 return false, 'password_timeout', activeConfig.messages.passwordTimeout
@@ -326,7 +376,7 @@ local function waitForEntryDecision(entry, state)
     end
 end
 
-AddEventHandler('playerConnecting', function(playerName, _, deferrals)
+local function onPlayerConnecting(playerName, _, deferrals)
     local sourceKey = tostring(source)
     local deferralState
 
@@ -414,9 +464,9 @@ AddEventHandler('playerConnecting', function(playerName, _, deferrals)
             rejectDeferral(deferralState, activeConfig.messages.internalError, 'internal_error')
         end
     end
-end)
+end
 
-AddEventHandler('playerJoining', function(first, second)
+local function onPlayerJoining(first, second)
     local oldId = second or first
     if oldId == nil then
         log('playerJoining fired without oldID; in-flight entry could not be cleared.')
@@ -427,9 +477,9 @@ AddEventHandler('playerJoining', function(first, second)
     if completed then
         log(('Completed in-flight connection: entry=%d'):format(completed.id))
     end
-end)
+end
 
-AddEventHandler('playerDropped', function()
+local function onPlayerDropped()
     local sourceKey = tostring(source)
     local removed = queue:remove(sourceKey, 'disconnected')
     if removed and removed.payload and removed.payload.deferral then
@@ -441,29 +491,72 @@ AddEventHandler('playerDropped', function()
     if completed then
         log(('Cleared dropped in-flight connection: entry=%d'):format(completed.id))
     end
-end)
+end
 
-CreateThread(function()
+--- tickOnce is one admission ticker iteration. It is exposed on Lavender for the
+--- test harness (Lavender.__tickOnce) and wrapped by the ticker thread below.
+local function tickOnce()
+    local results = queue:tick()
+    for i = 1, #results.queueTimeouts do
+        local entry = results.queueTimeouts[i]
+        entry.payload.rejectMessage = activeConfig.messages.queueTimeout
+        entry.payload.rejectReason = 'queue_timeout'
+    end
+
+    for i = 1, #results.admitted do
+        local entry = results.admitted[i]
+        entry.payload.admitted = true
+    end
+    return results
+end
+
+local lastTickerErrorLogAt = -math.huge
+
+--- runTicker is the supervised admission loop. An unhandled exception inside
+--- this loop would terminate the coroutine while /metrics kept answering 200.
+--- The queue completes its state transitions regardless of observer failures,
+--- and the loop itself survives an iteration failure: it logs a rate-limited
+--- traceback, counts it, and continues. Liveness is exported so a scrape cannot
+--- masquerade as admission progress.
+local function runTicker()
     while true do
         Wait(100)
-
-        local results = queue:tick()
-        for i = 1, #results.queueTimeouts do
-            local entry = results.queueTimeouts[i]
-            entry.payload.rejectMessage = activeConfig.messages.queueTimeout
-            entry.payload.rejectReason = 'queue_timeout'
+        local started = os.clock()
+        local ok, err = xpcall(Lavender.__tickOnce or tickOnce, debug.traceback)
+        local elapsed = os.clock() - started
+        if ok then
+            metrics:recordTick(elapsed, nowSeconds(), os.time())
+        else
+            metrics:recordTickFailure()
+            local now = nowSeconds()
+            if now - lastTickerErrorLogAt >= 10 then
+                lastTickerErrorLogAt = now
+                log(('^1Admission ticker iteration failed (failures=%d); continuing: %s^7'):format(
+                    metrics.tickerFailures, tostring(err)))
+            end
         end
-
-        for i = 1, #results.admitted do
-            local entry = results.admitted[i]
-            entry.payload.admitted = true
-        end
+        metrics:setEventCallbackErrors(queue.eventCallbackErrors)
     end
-end)
+end
+
+Lavender.__tickOnce = tickOnce
+Lavender.__runTicker = runTicker
+
+if limiterEnabled then
+    AddEventHandler('playerConnecting', onPlayerConnecting)
+    AddEventHandler('playerJoining', onPlayerJoining)
+    AddEventHandler('playerDropped', onPlayerDropped)
+    CreateThread(runTicker)
+else
+    log('^3lavender_enabled is false: limiter started INERT (no connection handlers, no ticker). Metrics still served with enabled=0.^7')
+end
 
 CreateThread(function()
     while true do
         Wait(1000)
+        if not limiterEnabled then
+            Wait(60000)
+        end
 
         local entries = queue:getEntries()
         for i = 1, #entries do
@@ -487,7 +580,9 @@ SetHttpHandler(Http.metricsHandler(
         return activeConfig.metrics
     end,
     function()
-        return metrics:render(queue:status())
+        local status = queue:status()
+        status.monotonicNow = nowSeconds()
+        return metrics:render(status)
     end
 ))
 

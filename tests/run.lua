@@ -943,6 +943,117 @@ test('FXServer entrypoint loads and registers its public interfaces', function()
     registeredCommand.callback(0, { 'priority', 'add', 'ip:203.0.113.4' })
 end)
 
+-- Entrypoint behaviour: enable switch, supervised ticker, rejection reasons.
+local function loadEntrypoint(enabledConvar)
+    local env = { handlers = {}, threads = {}, printed = {} }
+    GetCurrentResourceName = function() return 'lavender-test' end
+    GetGameTimer = function() return 0 end
+    GetConvar = function(name, fallback)
+        if name == 'lavender_enabled' then return enabledConvar end
+        return fallback
+    end
+    LoadResourceFile = function(_, path)
+        local file = assert(io.open(path, 'r'))
+        local raw = file:read('*a')
+        file:close()
+        return raw
+    end
+    SaveResourceFile = function() return true end
+    AddEventHandler = function(name, callback) env.handlers[name] = callback end
+    CreateThread = function(callback) env.threads[#env.threads + 1] = callback end
+    Wait = function() end
+    SetHttpHandler = function(callback) env.httpHandler = callback end
+    RegisterCommand = function() end
+    TriggerEvent = function() end
+    json = { decode = Json.decode, encode = function() return '{}' end }
+    local realPrint = print
+    print = function(...)
+        local parts = {}
+        for i = 1, select('#', ...) do parts[i] = tostring(select(i, ...)) end
+        env.printed[#env.printed + 1] = table.concat(parts, ' ')
+    end
+    local ok, err = pcall(dofile, 'server/main.lua')
+    print = realPrint
+    assertTrue(ok, tostring(err))
+    env.metrics = function()
+        local result = {}
+        env.httpHandler({ method = 'GET', path = '/metrics' }, {
+            writeHead = function(status) result.status = status end,
+            send = function(body) result.body = body end,
+        })
+        return result
+    end
+    return env
+end
+
+test('entrypoint starts inert when lavender_enabled is false and logs effective settings', function()
+    local env = loadEntrypoint('false')
+    assertEqual(env.handlers.playerConnecting, nil, 'inert resource must not intercept connections')
+    assertEqual(env.handlers.playerJoining, nil)
+    assertEqual(env.handlers.playerDropped, nil)
+    assertEqual(#env.threads, 1, 'only the (idle) presence thread is created; no ticker')
+    local m = env.metrics()
+    assertEqual(m.status, 200)
+    assertContains(m.body, 'lavender_connection_ratelimit_enabled 0')
+    local sawSettings = false
+    for _, line in ipairs(env.printed) do
+        if line:find('Effective settings: enabled=false', 1, true) and line:find('burst=', 1, true) and line:find('maxSize=', 1, true) then
+            sawSettings = true
+        end
+        assertNotContains(line, 'secret', 'effective settings must not print the password secret')
+    end
+    assertTrue(sawSettings, 'effective non-secret settings are logged at start')
+end)
+
+test('admission ticker survives an iteration failure and exports liveness', function()
+    local env = loadEntrypoint('true')
+    assertTrue(type(env.handlers.playerConnecting) == 'function')
+    assertEqual(#env.threads, 2, 'ticker and presence threads')
+    local originalTick = Lavender.__tickOnce
+    local calls = 0
+    Lavender.__tickOnce = function()
+        calls = calls + 1
+        if calls == 1 then error('injected ticker failure') end
+        return originalTick()
+    end
+    local waits = 0
+    Wait = function()
+        waits = waits + 1
+        if waits > 3 then error('STOP') end
+    end
+    local realPrint = print
+    local printed = {}
+    print = function(...) printed[#printed + 1] = table.concat({ ... }, ' ') end
+    local ok, err = pcall(env.threads[1])
+    print = realPrint
+    Lavender.__tickOnce = originalTick
+    assertTrue(not ok and tostring(err):find('STOP', 1, true) ~= nil, 'loop only ended by the harness sentinel, not by the injected failure: ' .. tostring(err))
+    assertEqual(calls, 3, 'ticker kept iterating after the failure')
+    local body = env.metrics().body
+    assertContains(body, 'lavender_connection_ratelimit_ticker_failures_total 1')
+    assertContains(body, 'lavender_connection_ratelimit_ticker_iterations_total 2')
+    assertContains(body, 'lavender_connection_ratelimit_tick_duration_seconds_count 2')
+    assertContains(body, 'lavender_connection_ratelimit_ticker_last_tick_age_seconds')
+    local sawLog = false
+    for _, line in ipairs(printed) do
+        if line:find('Admission ticker iteration failed', 1, true) then sawLog = true end
+    end
+    assertTrue(sawLog, 'ticker failure is logged with a traceback')
+end)
+
+test('password gate rejections are counted by disconnected reason', function()
+    local config = configWith()
+    local metrics = Metrics.new(config)
+    metrics:recordRejection('disconnected_endpoint_missing')
+    metrics:recordRejection('disconnected_deferral_closed')
+    local body = metrics:render({ queueSize = 0, eligibleQueueSize = 0, inFlight = 0 })
+    assertContains(body, 'rejections_total{reason="disconnected_endpoint_missing"} 1')
+    assertContains(body, 'rejections_total{reason="disconnected_deferral_closed"} 1')
+end)
+
+-- Queue observer isolation and scaling tests.
+dofile('tests/queue_scale.lua')(test, assertEqual, assertTrue)
+
 local passed = 0
 for i = 1, #tests do
     local current = tests[i]

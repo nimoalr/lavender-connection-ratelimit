@@ -3,7 +3,13 @@ Lavender = Lavender or {}
 local Metrics = {}
 Metrics.__index = Metrics
 
-local rejectionReasons = { 'duplicate', 'queue_full', 'internal_error', 'password_failed', 'password_timeout' }
+-- 'disconnected_*' distinguish a password prompt abandoned because the source
+-- vanished from one whose deferral was closed; both must be counted, and the
+-- vocabulary stays fixed so label cardinality is bounded.
+local rejectionReasons = {
+    'duplicate', 'queue_full', 'internal_error', 'password_failed', 'password_timeout',
+    'disconnected_endpoint_missing', 'disconnected_deferral_closed',
+}
 local departureReasons = { 'admitted', 'disconnected', 'queue_timeout', 'resource_stop' }
 
 local function zeroMap(keys)
@@ -63,7 +69,50 @@ function Metrics.new(config)
         waitCount = 0,
         waitSum = 0,
         waitBuckets = bucketMap(config),
+        -- Ticker liveness: a successful scrape of this endpoint says nothing about
+        -- whether admissions are progressing. These are fed by the entrypoint.
+        enabled = 1,
+        tickerIterations = 0,
+        tickerFailures = 0,
+        tickerLastRunAt = 0,     -- wall-clock unix seconds of the last completed tick
+        tickerLastRunClock = 0,  -- monotonic seconds (same clock as the queue) of the last completed tick
+        tickDurationCount = 0,
+        tickDurationSum = 0,
+        tickDurationBuckets = { ['0.001'] = 0, ['0.005'] = 0, ['0.01'] = 0, ['0.05'] = 0, ['0.1'] = 0, ['0.5'] = 0, ['1'] = 0, ['5'] = 0 },
+        eventCallbackErrors = 0,
     }, Metrics)
+end
+
+local tickBucketOrder = { 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5 }
+
+function Metrics:setEnabled(enabled)
+    self.enabled = enabled and 1 or 0
+end
+
+--- recordTick records one completed ticker iteration. seconds is CPU/wall time
+--- of the iteration; monotonicNow is the queue clock at completion; wallNow is
+--- os.time().
+function Metrics:recordTick(seconds, monotonicNow, wallNow)
+    self.tickerIterations = self.tickerIterations + 1
+    self.tickerLastRunClock = monotonicNow or self.tickerLastRunClock
+    self.tickerLastRunAt = wallNow or self.tickerLastRunAt
+    seconds = math.max(0, seconds or 0)
+    self.tickDurationCount = self.tickDurationCount + 1
+    self.tickDurationSum = self.tickDurationSum + seconds
+    for i = 1, #tickBucketOrder do
+        if seconds <= tickBucketOrder[i] then
+            local key = tostring(tickBucketOrder[i])
+            self.tickDurationBuckets[key] = (self.tickDurationBuckets[key] or 0) + 1
+        end
+    end
+end
+
+function Metrics:recordTickFailure()
+    self.tickerFailures = self.tickerFailures + 1
+end
+
+function Metrics:setEventCallbackErrors(count)
+    self.eventCallbackErrors = count or 0
 end
 
 function Metrics:setConfig(config)
@@ -164,6 +213,36 @@ function Metrics:render(queueStatus)
     histogramSamples[#histogramSamples + 1] = ('%s_queue_wait_seconds_sum %s'):format(prefix, number(self.waitSum))
     histogramSamples[#histogramSamples + 1] = ('%s_queue_wait_seconds_count %d'):format(prefix, self.waitCount)
     appendFamily(lines, prefix .. '_queue_wait_seconds', 'Time spent in the admission queue before release.', 'histogram', histogramSamples)
+
+    appendFamily(lines, prefix .. '_enabled', 'Whether the limiter is active (1) or started inert via the lavender_enabled convar (0).', 'gauge', {
+        ('%s_enabled %d'):format(prefix, self.enabled),
+    })
+    appendFamily(lines, prefix .. '_ticker_iterations_total', 'Completed admission ticker iterations.', 'counter', {
+        ('%s_ticker_iterations_total %d'):format(prefix, self.tickerIterations),
+    })
+    appendFamily(lines, prefix .. '_ticker_failures_total', 'Admission ticker iterations that raised an error (the loop continues).', 'counter', {
+        ('%s_ticker_failures_total %d'):format(prefix, self.tickerFailures),
+    })
+    appendFamily(lines, prefix .. '_ticker_last_run_timestamp_seconds', 'Unix time of the last completed ticker iteration.', 'gauge', {
+        ('%s_ticker_last_run_timestamp_seconds %d'):format(prefix, self.tickerLastRunAt),
+    })
+    local tickerAge = (queueStatus and queueStatus.monotonicNow and self.tickerLastRunClock > 0)
+        and math.max(0, queueStatus.monotonicNow - self.tickerLastRunClock) or -1
+    appendFamily(lines, prefix .. '_ticker_last_tick_age_seconds', 'Seconds since the last completed ticker iteration on the resource clock (-1 before the first tick). Rising while scrapes succeed means admissions are stalled.', 'gauge', {
+        ('%s_ticker_last_tick_age_seconds %s'):format(prefix, number(tickerAge)),
+    })
+    local tickSamples = {}
+    for i = 1, #tickBucketOrder do
+        local key = tostring(tickBucketOrder[i])
+        tickSamples[#tickSamples + 1] = ('%s_tick_duration_seconds_bucket{le="%s"} %d'):format(prefix, number(tickBucketOrder[i]), self.tickDurationBuckets[key] or 0)
+    end
+    tickSamples[#tickSamples + 1] = ('%s_tick_duration_seconds_bucket{le="+Inf"} %d'):format(prefix, self.tickDurationCount)
+    tickSamples[#tickSamples + 1] = ('%s_tick_duration_seconds_sum %s'):format(prefix, number(self.tickDurationSum))
+    tickSamples[#tickSamples + 1] = ('%s_tick_duration_seconds_count %d'):format(prefix, self.tickDurationCount)
+    appendFamily(lines, prefix .. '_tick_duration_seconds', 'Wall time of one admission ticker iteration (queue tick plus result handling).', 'histogram', tickSamples)
+    appendFamily(lines, prefix .. '_event_callback_errors_total', 'Queue observer callback errors isolated by the queue (state transitions completed anyway).', 'counter', {
+        ('%s_event_callback_errors_total %d'):format(prefix, self.eventCallbackErrors),
+    })
 
     return table.concat(lines, '\n') .. '\n'
 end
