@@ -13,6 +13,7 @@ local Defaults = {
         activeDuplicatePolicy = 'queue',
         userCooldownSeconds = 60,
         recentHistorySeconds = 600,
+        maxActiveQueuedDuplicates = 8,
     },
     priority = {
         identifiers = {},

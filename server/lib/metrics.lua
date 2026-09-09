@@ -7,7 +7,7 @@ Metrics.__index = Metrics
 -- vanished from one whose deferral was closed; both must be counted, and the
 -- vocabulary stays fixed so label cardinality is bounded.
 local rejectionReasons = {
-    'duplicate', 'queue_full', 'internal_error', 'password_failed', 'password_timeout',
+    'duplicate', 'duplicate_flood', 'queue_full', 'internal_error', 'password_failed', 'password_timeout',
     'disconnected_endpoint_missing', 'disconnected_deferral_closed',
 }
 local departureReasons = { 'admitted', 'disconnected', 'queue_timeout', 'resource_stop' }

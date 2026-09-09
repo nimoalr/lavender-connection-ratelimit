@@ -136,4 +136,47 @@ return function(test, assertEqual, assertTrue)
         q:tick()
         assertEqual(reconciles, 1, 'an idle frame (no arrivals, admissions, or expiries) skips the reconcile')
     end)
+
+    test('a single identity cannot flood the queue past the configured cap', function()
+        -- Without a cap, one identity opening many connections makes the
+        -- reconcile pass O(n^2). The cap bounds the group, keeping the queue
+        -- and the reconcile cheap. Excess attempts are rejected as
+        -- 'duplicate_flood'.
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.identity.activeDuplicatePolicy = 'queue'
+        config.identity.maxActiveQueuedDuplicates = 5
+        config.release.ratePerSecond = 1
+        config.release.burst = 0
+        config.release.maxInFlight = 0
+        config.queue.maxSize = 10000
+        local now = 0
+        local q = Queue.new({ config = config, now = function() return now end })
+
+        local identity = identityFor('FLOOD')
+        local queued, flood = 0, 0
+        for i = 1, 200 do
+            local entry, reason = q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.5', identitySet = identity, payload = {} })
+            if entry then
+                queued = queued + 1
+            elseif reason == 'duplicate_flood' then
+                flood = flood + 1
+            end
+        end
+
+        assertEqual(queued, 5, 'at most the cap of same-identity connections may queue')
+        assertEqual(flood, 195, 'every attempt past the cap is rejected as duplicate_flood')
+        assertEqual(q:status().queueSize, 5)
+
+        -- A different identity is unaffected by another identity's cap.
+        local other = q:enqueue({ sourceKey = 'other', ip = '198.51.100.6', identitySet = identityFor('SEPARATE'), payload = {} })
+        assertTrue(other, 'a distinct identity still queues normally')
+
+        -- A cap of 0 disables the limit.
+        config.identity.maxActiveQueuedDuplicates = 0
+        local q2 = Queue.new({ config = config, now = function() return now end })
+        for i = 1, 20 do
+            q2:enqueue({ sourceKey = 'b' .. i, ip = '198.51.100.7', identitySet = identityFor('FLOOD2'), payload = {} })
+        end
+        assertEqual(q2:status().queueSize, 20, 'a cap of 0 disables the flood limit')
+    end)
 end

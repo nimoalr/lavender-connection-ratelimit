@@ -15,6 +15,7 @@ local allowedKeys = {
         activeDuplicatePolicy = true,
         userCooldownSeconds = true,
         recentHistorySeconds = true,
+        maxActiveQueuedDuplicates = true,
     },
     priority = {
         identifiers = true,
@@ -221,6 +222,10 @@ function Config.validate(candidate)
     expectEnumString(errors, identity, 'activeDuplicatePolicy', 'identity.activeDuplicatePolicy', { 'queue', 'reject' })
     expectNumber(errors, identity, 'userCooldownSeconds', 'identity.userCooldownSeconds', 0, 86400, false)
     expectNumber(errors, identity, 'recentHistorySeconds', 'identity.recentHistorySeconds', 1, 604800, false)
+    -- Optional: absent means the default cap applies. 0 disables the cap.
+    if identity and identity.maxActiveQueuedDuplicates ~= nil then
+        expectNumber(errors, identity, 'maxActiveQueuedDuplicates', 'identity.maxActiveQueuedDuplicates', 0, 100000, true)
+    end
     if identity and type(identity.userCooldownSeconds) == 'number'
         and type(identity.recentHistorySeconds) == 'number'
         and identity.recentHistorySeconds < identity.userCooldownSeconds then

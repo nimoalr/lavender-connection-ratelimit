@@ -261,25 +261,36 @@ end
 function Queue:_activeDuplicateInfo(candidate, now)
     local threshold = self.config.identity.similarityThreshold
     local identitySet = candidate.identitySet or {}
-    local candidates = self.queuedIndex:candidates(identitySet)
 
-    -- Latest queued entry (highest position) that matches by identity or shares
-    -- the sourceKey: same result as the original reverse scan, but only the
-    -- candidate subset pays the Jaccard comparison.
-    for i = #self.entries, 1, -1 do
-        local existing = self.entries[i]
-        if existing.sourceKey == candidate.sourceKey
-            or (candidates[existing] and Identity.matches(identitySet, existing.identitySet, threshold)) then
-            return {
-                state = 'queued',
-                entry = existing,
-                waitSeconds = math.min(
-                    self:estimateWait(existing),
-                    math.max(0, self.config.queue.maxWaitSeconds - (now - existing.enqueuedAt))
-                ),
-                position = i,
-            }
+    -- Scan only the candidate subset (entries sharing an identifier), not the
+    -- whole queue. entry.id is monotonic and the queue is FIFO, so the highest
+    -- id among matches is the latest-queued duplicate. Also count the matches so
+    -- enqueue can cap a single-identity flood. O(k) in the group size, not O(n).
+    local sourceMatch = self.entriesBySourceKey[candidate.sourceKey]
+    local best, count = nil, 0
+    if sourceMatch then
+        best, count = sourceMatch, 1
+    end
+    for record in pairs(self.queuedIndex:candidates(identitySet)) do
+        if record ~= sourceMatch and Identity.matches(identitySet, record.identitySet, threshold) then
+            count = count + 1
+            if not best or record.id > best.id then
+                best = record
+            end
         end
+    end
+
+    if best then
+        return {
+            state = 'queued',
+            entry = best,
+            count = count,
+            waitSeconds = math.min(
+                self:estimateWait(best),
+                math.max(0, self.config.queue.maxWaitSeconds - (now - best.enqueuedAt))
+            ),
+            position = best.position,
+        }
     end
 
     local joining = self:_matchingInFlightFor(identitySet, candidate.sourceKey)
@@ -287,6 +298,7 @@ function Queue:_activeDuplicateInfo(candidate, now)
         return {
             state = 'joining',
             entry = joining,
+            count = 0,
             waitSeconds = math.max(0, joining.expiresAt - now),
         }
     end
@@ -456,6 +468,16 @@ function Queue:enqueue(candidate)
     local queueDuplicate = duplicate and self.config.identity.activeDuplicatePolicy == 'queue'
     if duplicate and not queueDuplicate then
         return nil, 'duplicate', duplicate
+    end
+    -- Cap how many connections one identity may hold in the queue at once. This
+    -- bounds a single-identity flood, which would otherwise make the reconcile
+    -- pass O(n^2). A nil cap (config predates this field) defaults on; 0 disables.
+    if queueDuplicate and duplicate.state == 'queued' then
+        local cap = self.config.identity.maxActiveQueuedDuplicates
+        if cap == nil then cap = 8 end
+        if cap > 0 and (duplicate.count or 0) >= cap then
+            return nil, 'duplicate_flood', duplicate
+        end
     end
     if #self.entries >= self.config.queue.maxSize then
         return nil, 'queue_full'

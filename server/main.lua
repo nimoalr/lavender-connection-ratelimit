@@ -220,6 +220,13 @@ local rejectionMessages = {
         local wait = Util.formatDuration((details and details.waitSeconds) or activeConfig.display.refreshSeconds)
         return ('%s Please try again in about %s.'):format(activeConfig.messages.queueFull, wait)
     end,
+    duplicate_flood = function(details)
+        local wait = Util.formatDuration((details and details.waitSeconds) or activeConfig.identity.userCooldownSeconds)
+        return ('%s Please wait about %s before retrying.'):format(
+            activeConfig.messages.duplicate,
+            wait
+        )
+    end,
 }
 
 local function rejectDeferral(state, message, reason)

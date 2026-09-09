@@ -81,6 +81,7 @@ function ConfigLua.encode(config)
     addField(lines, '        ', 'How active matching queued/joining attempts are handled: "queue" or "reject".', 'activeDuplicatePolicy', config.identity.activeDuplicatePolicy)
     addField(lines, '        ', 'Seconds a recently admitted matching user must wait before becoming eligible again.', 'userCooldownSeconds', config.identity.userCooldownSeconds)
     addField(lines, '        ', 'Seconds to retain recently admitted identity sets; must cover the user cooldown.', 'recentHistorySeconds', config.identity.recentHistorySeconds)
+    addField(lines, '        ', 'Max connections one identity may hold in the queue at once (bounds a single-identity flood). 0 disables the cap.', 'maxActiveQueuedDuplicates', config.identity.maxActiveQueuedDuplicates or 8)
     add(lines, '    },')
     add(lines, '')
 
