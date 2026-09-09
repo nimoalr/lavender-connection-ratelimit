@@ -31,26 +31,30 @@ function Card.statusText(reason, remaining)
 end
 
 function Card.fallbackMessage(entry, queue, config, runtime)
-    local position = queue:getPosition(entry.id) or 0
+    -- position and estimatedWait are cached on the entry by the reconcile pass,
+    -- so a card render stays O(1) rather than scanning the whole queue.
+    local position = entry.position or 0
     local reason, remaining = queue:getEntryReason(entry)
     runtime = runtime or {}
 
     return ('%s | Position %d/%d | Waited %s | Estimated %s | Players online %s | %s'):format(
         config.display.title,
         position,
-        queue:status().queueSize,
+        queue:size(),
         Util.formatDuration(queue.now() - entry.enqueuedAt),
-        Util.formatDuration(queue:estimateWait(entry)),
+        Util.formatDuration(entry.estimatedWait or 0),
         runtime.playersOnlineText or 'unknown',
         Card.statusText(reason, remaining)
     )
 end
 
 function Card.build(entry, queue, config, runtime)
-    local status = queue:status()
-    local position = queue:getPosition(entry.id) or 0
+    -- Cached, O(1) reads (see fallbackMessage).
+    local queueSize = queue:size()
+    local position = entry.position or 0
     local reason, remaining = queue:getEntryReason(entry)
     local waited = queue.now() - entry.enqueuedAt
+    local estimated = entry.estimatedWait or 0
     runtime = runtime or {}
 
     return {
@@ -82,9 +86,9 @@ function Card.build(entry, queue, config, runtime)
                     {
                         type = 'FactSet',
                         facts = {
-                            { title = 'Position', value = ('%d / %d'):format(position, status.queueSize) },
+                            { title = 'Position', value = ('%d / %d'):format(position, queueSize) },
                             { title = 'Time queued', value = Util.formatDuration(waited) },
-                            { title = 'Estimated wait', value = ('about %s'):format(Util.formatDuration(queue:estimateWait(entry))) },
+                            { title = 'Estimated wait', value = ('about %s'):format(Util.formatDuration(estimated)) },
                             { title = 'Players online', value = runtime.playersOnlineText or 'unknown' },
                         },
                     },

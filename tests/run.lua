@@ -383,6 +383,9 @@ test('IP pacing delays recalculate when queued attempts are removed', function()
     queue:enqueue(candidate('a', '192.0.2.1'))
     local second = queue:enqueue(candidate('b', '192.0.2.1'))
     local third = queue:enqueue(candidate('c', '192.0.2.1'))
+    -- Wait estimates refresh on the ticker (or an explicit reconcile), not
+    -- synchronously on each enqueue; the runtime ticker does this every frame.
+    queue:reconcile()
 
     local reason, remaining = queue:getEntryReason(second)
     assertEqual(reason, 'ip_pacing')
@@ -834,6 +837,36 @@ test('Prometheus output is valid-shaped, low-cardinality, and ends with newline'
     assertNotContains(body, 'private-name')
     assertNotContains(body, '203.0.113.9')
     assertNotContains(body, 'secret')
+end)
+
+test('metrics expose queue diagnostics: reconcile, duplicates, in-flight, and flood indicators', function()
+    local config = configWith()
+    local metrics = Metrics.new(config)
+    metrics:recordReconcile(0.003)
+    metrics:recordPresenceSweep(0.002, 4)
+    metrics:recordQueueEvent('queued', { duplicateState = 'queued' })
+    metrics:recordQueueEvent('queued', { duplicateState = 'joining' })
+    metrics:recordQueueEvent('in_flight_completed', { inFlightDurationSeconds = 12 })
+    metrics:recordQueueEvent('in_flight_timeout', { inFlightDurationSeconds = 120 })
+
+    local body = metrics:render({
+        queueSize = 900, eligibleQueueSize = 100, inFlight = 40,
+        tokens = 7.5, ratePerSecond = 20, maxInFlight = 180, backlogHighWater = 1200,
+        index = { identifiers = 640, largestGroup = 512 },
+    })
+
+    assertContains(body, '# TYPE lavender_connection_ratelimit_reconcile_duration_seconds histogram')
+    assertContains(body, 'lavender_connection_ratelimit_reconcile_duration_seconds_count 1')
+    assertContains(body, 'lavender_connection_ratelimit_presence_sweep_duration_seconds_count 1')
+    assertContains(body, 'lavender_connection_ratelimit_abandoned_removed_total 4')
+    assertContains(body, 'lavender_connection_ratelimit_duplicates_detected_total{state="queued"} 1')
+    assertContains(body, 'lavender_connection_ratelimit_duplicates_detected_total{state="joining"} 1')
+    assertContains(body, 'lavender_connection_ratelimit_in_flight_duration_seconds_count 2')
+    assertContains(body, 'lavender_connection_ratelimit_in_flight_timeouts_total 1')
+    assertContains(body, 'lavender_connection_ratelimit_token_bucket_available 7.5')
+    assertContains(body, 'lavender_connection_ratelimit_release_max_in_flight 180')
+    assertContains(body, 'lavender_connection_ratelimit_queue_backlog_high_water 1200')
+    assertContains(body, 'lavender_connection_ratelimit_identity_largest_duplicate_group 512')
 end)
 
 test('metrics HTTP handler returns 200, 404, 405, and 500 correctly', function()

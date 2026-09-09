@@ -100,4 +100,40 @@ return function(test, assertEqual, assertTrue)
         assertTrue(tickCost < 0.05, ('tick at n=959 took %.3fs'):format(tickCost))
         assertTrue(expireCost < 0.20, ('batch expiry of %d at n=959 took %.3fs'):format(expired, expireCost))
     end)
+
+    test('enqueue defers the queue-wide reconcile to the ticker (O(1) arrivals)', function()
+        -- A mass reconnect is one enqueue per arrival on the game thread. If
+        -- enqueue reconciled the whole queue each time, that path would be
+        -- O(n^2) and stall svMain (the original failure). This asserts, without
+        -- timing, that enqueue does NOT reconcile, that a frame reconciles at
+        -- most once, and that an idle frame skips the reconcile entirely.
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.identity.activeDuplicatePolicy = 'queue'
+        config.identity.userCooldownSeconds = 60
+        config.ip.spacingSeconds = 1
+        config.queue.maxSize = 4096
+        config.queue.maxWaitSeconds = 1e9
+        config.release.ratePerSecond = 1
+        config.release.burst = 0
+        config.release.maxInFlight = 0 -- no admission, so the queue holds steady
+        local now = 100
+        local q = Queue.new({ config = config, now = function() return now end })
+
+        local reconciles = 0
+        local original = q._reconcileDelays
+        q._reconcileDelays = function(self, ...) reconciles = reconciles + 1; return original(self, ...) end
+
+        for i = 1, 200 do
+            q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.' .. (i % 200 + 1), identitySet = identityFor('p' .. i), payload = {} })
+        end
+        assertEqual(reconciles, 0, 'enqueue must not reconcile the whole queue; it defers to the ticker')
+        assertTrue(q.dirty, 'enqueue marks the queue dirty for the next reconcile')
+
+        q:tick()
+        assertEqual(reconciles, 1, 'a dirty frame reconciles the whole queue exactly once')
+        assertTrue(not q.dirty, 'the reconcile clears the dirty flag')
+
+        q:tick()
+        assertEqual(reconciles, 1, 'an idle frame (no arrivals, admissions, or expiries) skips the reconcile')
+    end)
 end

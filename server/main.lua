@@ -234,17 +234,18 @@ local function rejectDeferral(state, message, reason)
 end
 
 local function entryStatusForLog(entry)
-    local status = queue:status()
-    local position = queue:getPosition(entry.id) or 0
+    -- O(1): position and estimatedWait are cached on the entry by the reconcile
+    -- pass, and size() avoids the eligibility scan. This runs once per accepted
+    -- connection, so it must not scan the whole queue.
     local reason, remaining = queue:getEntryReason(entry)
 
     return ('entry=%d position=%d/%d reason=%s delay=%s estimated=%s'):format(
         entry.id,
-        position,
-        status.queueSize,
+        entry.position or 0,
+        queue:size(),
         tostring(reason),
         Util.formatDuration(remaining or 0),
-        Util.formatDuration(queue:estimateWait(entry))
+        Util.formatDuration(entry.estimatedWait or 0)
     )
 end
 
@@ -526,6 +527,9 @@ local function runTicker()
         local elapsed = os.clock() - started
         if ok then
             metrics:recordTick(elapsed, nowSeconds(), os.time())
+            if type(err) == 'table' and err.reconcileSeconds ~= nil then
+                metrics:recordReconcile(err.reconcileSeconds)
+            end
         else
             metrics:recordTickFailure()
             local now = nowSeconds()
@@ -558,20 +562,26 @@ CreateThread(function()
             Wait(60000)
         end
 
+        local sweepStart = os.clock()
+        local removedCount = 0
         local entries = queue:getEntries()
         for i = 1, #entries do
             local entry = entries[i]
             local removed = queue:updatePresence(entry.sourceKey, sourceStillConnected(entry.sourceKey))
-            if removed and removed.payload and removed.payload.deferral then
-                log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
-                    removed.id,
-                    queue:status().queueSize
-                ))
-                if not removed.payload.deferral.closed then
-                    rejectDeferral(removed.payload.deferral, activeConfig.messages.disconnected, 'disconnected')
+            if removed then
+                removedCount = removedCount + 1
+                if removed.payload and removed.payload.deferral then
+                    log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
+                        removed.id,
+                        queue:size()
+                    ))
+                    if not removed.payload.deferral.closed then
+                        rejectDeferral(removed.payload.deferral, activeConfig.messages.disconnected, 'disconnected')
+                    end
                 end
             end
         end
+        metrics:recordPresenceSweep(os.clock() - sweepStart, removedCount)
     end
 end)
 
@@ -582,6 +592,7 @@ SetHttpHandler(Http.metricsHandler(
     function()
         local status = queue:status()
         status.monotonicNow = nowSeconds()
+        status.index = queue:indexStats()
         return metrics:render(status)
     end
 ))
