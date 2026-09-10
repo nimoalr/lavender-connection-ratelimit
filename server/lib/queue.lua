@@ -281,12 +281,19 @@ function Queue:_activeDuplicateInfo(candidate, now)
     end
 
     if best then
+        -- The reconcile pass caches each entry's wait estimate every frame;
+        -- use it rather than the O(n) live scan, falling back only for an entry
+        -- enqueued in this same frame (not yet reconciled).
+        local estimate = best.estimatedWait
+        if estimate == nil then
+            estimate = self:estimateWait(best)
+        end
         return {
             state = 'queued',
             entry = best,
             count = count,
             waitSeconds = math.min(
-                self:estimateWait(best),
+                estimate,
                 math.max(0, self.config.queue.maxWaitSeconds - (now - best.enqueuedAt))
             ),
             position = best.position,
@@ -517,8 +524,9 @@ function Queue:enqueue(candidate)
     }
 
     self.entries[#self.entries + 1] = entry
-    entry.position = #self.entries      -- refreshed by reconcile; initialised here
-    entry.estimatedWait = entry.estimatedWait or 0
+    entry.position = #self.entries -- refreshed by reconcile; initialised here
+    -- estimatedWait stays nil until the first reconcile so readers can tell
+    -- "not yet estimated" from a real zero (display shows 0 either way).
     self.entriesById[entry.id] = entry
     self.entriesBySourceKey[entry.sourceKey] = entry
     self.queuedIndex:add(entry, entry.identitySet)
@@ -607,6 +615,33 @@ end
 --- eligibility). Display and log paths use it to avoid an O(n) scan per call.
 function Queue:size()
     return #self.entries
+end
+
+--- sweepPresence marks every queued entry present or absent in ONE pass and
+--- removes those absent past the disconnect grace with ONE reconcile. The
+--- per-entry updatePresence path reconciles on every removal, so a mass
+--- abandonment (the server emptying at once) would cost one full O(n)
+--- reconcile per departed player, O(n^2) on the game thread. presentFn takes a
+--- sourceKey and returns whether that source is still connected. Returns the
+--- removed entries (each also emitted as a 'removed' event, as before).
+function Queue:sweepPresence(presentFn)
+    local now = self.now()
+    local toRemove = {} -- descending indices, the order _removeMany expects
+    for i = #self.entries, 1, -1 do
+        local entry = self.entries[i]
+        if presentFn(entry.sourceKey) then
+            entry.missingSince = nil
+        else
+            entry.missingSince = entry.missingSince or now
+            if now - entry.missingSince >= self.config.queue.disconnectGraceSeconds then
+                toRemove[#toRemove + 1] = i
+            end
+        end
+    end
+    if #toRemove == 0 then
+        return {}
+    end
+    return self:_removeMany(toRemove, 'disconnected')
 end
 
 function Queue:isQueued(id)

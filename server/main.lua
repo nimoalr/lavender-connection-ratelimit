@@ -570,25 +570,22 @@ CreateThread(function()
         end
 
         local sweepStart = os.clock()
-        local removedCount = 0
-        local entries = queue:getEntries()
-        for i = 1, #entries do
-            local entry = entries[i]
-            local removed = queue:updatePresence(entry.sourceKey, sourceStillConnected(entry.sourceKey))
-            if removed then
-                removedCount = removedCount + 1
-                if removed.payload and removed.payload.deferral then
-                    log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
-                        removed.id,
-                        queue:size()
-                    ))
-                    if not removed.payload.deferral.closed then
-                        rejectDeferral(removed.payload.deferral, activeConfig.messages.disconnected, 'disconnected')
-                    end
+        -- One pass over the queue and ONE reconcile for every abandoned entry
+        -- removed, so a mass disconnect costs O(n), not a reconcile per player.
+        local removedEntries = queue:sweepPresence(sourceStillConnected)
+        for i = 1, #removedEntries do
+            local removed = removedEntries[i]
+            if removed.payload and removed.payload.deferral then
+                log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
+                    removed.id,
+                    queue:size()
+                ))
+                if not removed.payload.deferral.closed then
+                    rejectDeferral(removed.payload.deferral, activeConfig.messages.disconnected, 'disconnected')
                 end
             end
         end
-        metrics:recordPresenceSweep(os.clock() - sweepStart, removedCount)
+        metrics:recordPresenceSweep(os.clock() - sweepStart, #removedEntries)
     end
 end)
 

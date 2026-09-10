@@ -137,6 +137,85 @@ return function(test, assertEqual, assertTrue)
         assertEqual(reconciles, 1, 'an idle frame (no arrivals, admissions, or expiries) skips the reconcile')
     end)
 
+    test('a mass abandonment sweep reconciles once, not once per removed entry', function()
+        -- The server emptying at once used to cost one full reconcile per
+        -- departed player (O(n^2) on the game thread). sweepPresence batches the
+        -- removals into one reconcile and still emits every 'removed' event.
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.queue.maxSize = 4096
+        config.queue.disconnectGraceSeconds = 5
+        config.release.burst = 0
+        config.release.maxInFlight = 0
+        local now = 0
+        local removedEvents = 0
+        local q = Queue.new({ config = config, now = function() return now end,
+            onEvent = function(event) if event == 'removed' then removedEvents = removedEvents + 1 end end })
+        for i = 1, 500 do
+            assertTrue(q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.' .. (i % 200 + 1), identitySet = identityFor('p' .. i), payload = {} }))
+        end
+        q:tick() -- consume the enqueue dirtiness so the sweep's reconcile is measured alone
+
+        local reconciles = 0
+        local original = q._reconcileDelays
+        q._reconcileDelays = function(self, ...) reconciles = reconciles + 1; return original(self, ...) end
+
+        -- Everyone vanishes: first sweep only marks them missing (inside grace).
+        local removed = q:sweepPresence(function() return false end)
+        assertEqual(#removed, 0, 'within the grace nothing is removed')
+        assertEqual(reconciles, 0, 'marking presence must not reconcile')
+        -- Past the grace: all 500 go in ONE reconcile.
+        now = 10
+        removed = q:sweepPresence(function() return false end)
+        assertEqual(#removed, 500, 'every abandoned entry is removed')
+        assertEqual(reconciles, 1, 'a 500-entry abandonment reconciles exactly once')
+        assertEqual(removedEvents, 500, 'each removal is still observable as an event')
+        assertEqual(q:status().queueSize, 0)
+
+        -- A present entry is untouched and its missingSince clears.
+        local e = q:enqueue({ sourceKey = 'stay', ip = '198.51.100.9', identitySet = identityFor('stay'), payload = {} })
+        e.missingSince = now
+        q:sweepPresence(function() return true end)
+        assertEqual(e.missingSince, nil, 'a present entry is cleared')
+        assertEqual(q:status().queueSize, 1)
+    end)
+
+    test('a duplicate enqueue reports the cached wait estimate instead of rescanning the queue', function()
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.identity.activeDuplicatePolicy = 'reject'
+        config.queue.maxSize = 4096
+        config.queue.maxWaitSeconds = 900
+        config.release.ratePerSecond = 1
+        config.release.burst = 0
+        config.release.maxInFlight = 0
+        local now = 0
+        local q = Queue.new({ config = config, now = function() return now end })
+        local first = q:enqueue({ sourceKey = 'a', ip = '198.51.100.1', identitySet = identityFor('dup'), payload = {} })
+        assertTrue(first)
+        q:reconcile() -- caches first.estimatedWait
+        assertTrue(first.estimatedWait ~= nil, 'reconcile must cache the estimate')
+        first.estimatedWait = 42 -- distinguishable from any live computation
+
+        local scans = 0
+        local liveEstimate = q.estimateWait
+        q.estimateWait = function(self, entry) scans = scans + 1; return liveEstimate(self, entry) end
+
+        local entry, reason, details = q:enqueue({ sourceKey = 'b', ip = '198.51.100.2', identitySet = identityFor('dup'), payload = {} })
+        assertEqual(entry, nil)
+        assertEqual(reason, 'duplicate')
+        assertEqual(details.waitSeconds, 42, 'the rejection reports the cached estimate')
+        assertEqual(scans, 0, 'no O(n) live estimate on the duplicate path')
+
+        -- An entry enqueued in the same frame (not yet reconciled) falls back to
+        -- the live estimate rather than reporting nothing.
+        local fresh = q:enqueue({ sourceKey = 'c', ip = '198.51.100.3', identitySet = identityFor('fresh'), payload = {} })
+        assertTrue(fresh)
+        assertEqual(fresh.estimatedWait, nil, 'not yet reconciled')
+        local _, r2, d2 = q:enqueue({ sourceKey = 'd', ip = '198.51.100.4', identitySet = identityFor('fresh'), payload = {} })
+        assertEqual(r2, 'duplicate')
+        assertTrue(d2.waitSeconds >= 0)
+        assertEqual(scans, 1, 'the unreconciled case uses the live estimate once')
+    end)
+
     test('a single identity cannot flood the queue past the configured cap', function()
         -- Without a cap, one identity opening many connections makes the
         -- reconcile pass O(n^2). The cap bounds the group, keeping the queue

@@ -100,20 +100,32 @@ local rows = {}
 local next_i = 1
 for _, target in ipairs(checkpoints) do
     if target > PLAYERS then break end
-    -- grow the backlog to `target`, timing only the enqueue calls (what
+    -- grow the backlog to `target`, timing ONLY the enqueue calls (what
     -- onPlayerConnecting runs synchronously per arrival; it does NOT look up
-    -- position, so getPosition is measured separately below).
+    -- position, so getPosition is measured separately below). The loop must not
+    -- call status() (an O(n) scan) inside the timed region: count accepted
+    -- enqueues instead.
     local addFrom = next_i
+    local size = 0
+    if q.size then size = q:size() else size = q:status().queueSize end
     local t0 = os.clock()
-    while q:status().queueSize < target and next_i <= PLAYERS do
-        q:enqueue(arrivals[next_i])
+    while size < target and next_i <= PLAYERS do
+        if q:enqueue(arrivals[next_i]) then size = size + 1 end
         next_i = next_i + 1
     end
     local added = next_i - addFrom
     local enq_ms = added > 0 and (os.clock() - t0) * 1000 / added or 0
-    local size = q:status().queueSize
-    -- one tick() at this backlog, averaged over many iterations
-    local tick_ms = timeAvg(TICK_ITERS, function() q:tick() end)
+    size = q:status().queueSize
+    -- The DIRTY tick is the one that matters: with a dirty-gated reconcile only
+    -- the first tick after a change pays the O(n) pass, so averaging it with
+    -- clean ticks would understate the frame cost 20x. Force the flag before
+    -- every timed tick (a no-op on code without the flag, which reconciles on
+    -- every tick anyway) and report the clean tick separately.
+    local tick_ms = timeAvg(TICK_ITERS, function()
+        if q.dirty ~= nil then q.dirty = true end
+        q:tick()
+    end)
+    local clean_ms = timeAvg(TICK_ITERS, function() q:tick() end)
     -- getPosition() cost (used by the card/display refresh, not by the connect
     -- handler) -- reported so the display path's scaling is visible too.
     local pos_ms = 0
@@ -125,7 +137,7 @@ for _, target in ipairs(checkpoints) do
             return function() k = (k % #ids) + 1; q:getPosition(ids[k]) end
         end)())
     end
-    rows[#rows + 1] = { size = size, enq_ms = enq_ms, tick_ms = tick_ms, pos_ms = pos_ms }
+    rows[#rows + 1] = { size = size, enq_ms = enq_ms, tick_ms = tick_ms, clean_ms = clean_ms, pos_ms = pos_ms }
     if size < target then break end -- PLAYERS exhausted
 end
 
@@ -140,12 +152,12 @@ io.write('\n== connecting-storm result ==\n')
 io.write(('lib_dir          %s\n'):format(libDir))
 io.write(('backlog grown to %d  (dup fraction %.2f)\n'):format(last and last.size or 0, DUP_FRACTION))
 io.write('\ncost as the backlog grows (per-operation, admission frozen):\n')
-io.write('  queue_size   enqueue_ms   tick_ms   getPosition_ms\n')
+io.write('  queue_size   enqueue_ms   dirty_tick_ms   clean_tick_ms   getPosition_ms\n')
 for _, r in ipairs(rows) do
-    io.write(('  %9d   %10.4f   %8.4f   %12.4f\n'):format(r.size, r.enq_ms, r.tick_ms, r.pos_ms))
+    io.write(('  %9d   %10.4f   %13.4f   %13.4f   %14.4f\n'):format(r.size, r.enq_ms, r.tick_ms, r.clean_ms, r.pos_ms))
 end
-io.write('\nprojected worst single-frame stall (one 100ms frame at peak backlog):\n')
-io.write(('  %d arrivals/frame x %.4f ms enqueue  +  %.4f ms tick  =  %.1f ms\n'):format(
+io.write('\nprojected worst single-frame stall (one 100ms frame at peak backlog, dirty tick):\n')
+io.write(('  %d arrivals/frame x %.4f ms enqueue  +  %.4f ms dirty tick  =  %.1f ms\n'):format(
     perFrame, last and last.enq_ms or 0, last and last.tick_ms or 0, worst_frame_ms))
-io.write(('\nSUMMARY lib=%s backlog=%d enqueue_ms=%.4f tick_ms=%.4f worst_frame_ms=%.1f\n'):format(
-    libDir, last and last.size or 0, last and last.enq_ms or 0, last and last.tick_ms or 0, worst_frame_ms))
+io.write(('\nSUMMARY lib=%s backlog=%d enqueue_ms=%.4f dirty_tick_ms=%.4f clean_tick_ms=%.4f worst_frame_ms=%.1f\n'):format(
+    libDir, last and last.size or 0, last and last.enq_ms or 0, last and last.tick_ms or 0, last and last.clean_ms or 0, worst_frame_ms))
