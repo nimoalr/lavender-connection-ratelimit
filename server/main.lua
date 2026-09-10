@@ -567,6 +567,53 @@ else
     log('^3lavender_enabled is false: limiter started INERT (no connection handlers, no ticker). Metrics still served with enabled=0.^7')
 end
 
+-- Deferrals the presence sweep removed from the queue and still has to finish.
+-- Kept outside the sweep iteration so that nothing depends on one iteration
+-- running to completion: a later iteration, or resource stop, finishes them.
+local pendingSweepClaims = {}
+
+-- sweepOnce is one presence pass. It is exposed for the test harness
+-- (Lavender.__sweepOnce) and supervised by the presence thread below.
+local function sweepOnce()
+    local sweepStart = os.clock()
+    -- One pass over the queue and ONE reconcile for every abandoned entry
+    -- removed, so a mass disconnect costs O(n), not a reconcile per player.
+    local removedEntries = queue:sweepPresence(sourceStillConnected)
+    -- Claim every deferral BEFORE the first yield: rejecting one yields, and a
+    -- waiter that wakes meanwhile finds its entry gone and would mark its
+    -- state closed, which would skip the rejection here and never finish the
+    -- deferral.
+    for i = 1, #removedEntries do
+        local removed = removedEntries[i]
+        local state = removed.payload and removed.payload.deferral
+        if state then
+            log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
+                removed.id,
+                queue:size()
+            ))
+            if not state.closed then
+                state.claimedBySweep = true
+                pendingSweepClaims[state] = true
+            end
+        end
+    end
+    -- Finish every pending claim, including any a previous iteration left
+    -- behind. Each rejection is isolated: a failure closes that state (the
+    -- client is gone and its deferral cannot be finished any other way) and
+    -- never stops the others from being finished.
+    for state in pairs(pendingSweepClaims) do
+        if not state.closed then
+            local ok, rejected = pcall(rejectDeferral, state, activeConfig.messages.disconnected, 'disconnected')
+            if not ok or not rejected then
+                state.closed = true
+            end
+        end
+        pendingSweepClaims[state] = nil
+    end
+    metrics:recordPresenceSweep(os.clock() - sweepStart, #removedEntries)
+end
+Lavender.__sweepOnce = sweepOnce
+
 CreateThread(function()
     while true do
         Wait(1000)
@@ -574,33 +621,12 @@ CreateThread(function()
             Wait(60000)
         end
 
-        local sweepStart = os.clock()
-        -- One pass over the queue and ONE reconcile for every abandoned entry
-        -- removed, so a mass disconnect costs O(n), not a reconcile per player.
-        local removedEntries = queue:sweepPresence(sourceStillConnected)
-        -- Claim every deferral BEFORE the first yield: rejecting one yields,
-        -- and a waiter that wakes meanwhile finds its entry gone and would mark
-        -- its state closed, which would skip the rejection here and never
-        -- finish the deferral.
-        local toReject = {}
-        for i = 1, #removedEntries do
-            local removed = removedEntries[i]
-            local state = removed.payload and removed.payload.deferral
-            if state then
-                log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
-                    removed.id,
-                    queue:size()
-                ))
-                if not state.closed then
-                    state.claimedBySweep = true
-                    toReject[#toReject + 1] = state
-                end
-            end
+        -- Supervised like the admission ticker: one failing pass is logged and
+        -- the next second's pass runs regardless.
+        local ok, err = xpcall(Lavender.__sweepOnce or sweepOnce, debug.traceback)
+        if not ok then
+            log(('Presence sweep failed: %s'):format(tostring(err)))
         end
-        for i = 1, #toReject do
-            rejectDeferral(toReject[i], activeConfig.messages.disconnected, 'disconnected')
-        end
-        metrics:recordPresenceSweep(os.clock() - sweepStart, #removedEntries)
     end
 end)
 
@@ -820,6 +846,15 @@ AddEventHandler('onResourceStop', function(stoppedResource)
             pcall(state.object.done, message)
             state.closed = true
         end
+    end
+    -- Deferrals the presence sweep removed but had not finished yet are no
+    -- longer in the queue; finish them here so no client is left waiting.
+    for state in pairs(pendingSweepClaims) do
+        if not state.closed then
+            pcall(state.object.done, message)
+            state.closed = true
+        end
+        pendingSweepClaims[state] = nil
     end
 end)
 

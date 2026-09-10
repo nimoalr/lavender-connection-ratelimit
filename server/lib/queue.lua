@@ -648,12 +648,13 @@ function Queue:size()
 end
 
 --- sweepPresence marks every queued entry present or absent in ONE pass and
---- removes those absent past the disconnect grace with ONE reconcile. The
---- per-entry updatePresence path reconciles on every removal, so a mass
---- abandonment (the server emptying at once) would cost one full O(n)
---- reconcile per departed player, O(n^2) on the game thread. presentFn takes a
---- sourceKey and returns whether that source is still connected. Returns the
---- removed entries (each also emitted as a 'removed' event, as before).
+--- removes those absent past the disconnect grace in ONE compaction with ONE
+--- reconcile, so a mass abandonment (the server emptying at once) costs O(n)
+--- rather than one array shift and one refresh per departed player. The
+--- per-entry updatePresence path below is kept for callers that track a
+--- single source. presentFn takes a sourceKey and returns whether that source
+--- is still connected. Returns the removed entries (each also emitted as a
+--- 'removed' event, as before).
 function Queue:sweepPresence(presentFn)
     local now = self.now()
     local toRemove = {}

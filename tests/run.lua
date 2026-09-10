@@ -1185,6 +1185,134 @@ test('presence sweep completes every abandoned deferral even when waiters wake m
     assertTrue(ok, tostring(err))
 end)
 
+
+test('presence sweep survives a failing rejection and resource stop finishes its pending claims', function()
+    -- Same coroutine scheduler as the test above. Player 1's deferral throws
+    -- on done(): that rejection must not abort the sweep or leave the state
+    -- open, and player 2 must still be finished. Then, with a claim parked
+    -- mid-rejection, resource stop must finish it rather than leave the
+    -- client waiting on a deferral nobody owns.
+    local env = loadEntrypoint('true')
+    local gameMs = 0
+    GetGameTimer = function() return gameMs end
+    local connected = { ['1'] = true, ['2'] = true, ['3'] = true }
+    GetPlayerIdentifiers = function(src)
+        if connected[tostring(src)] then return { 'license:sup-' .. tostring(src) } end
+        return {}
+    end
+    GetNumPlayerTokens = function() return 0 end
+    GetPlayerEndpoint = function(src)
+        if connected[tostring(src)] then return '198.51.100.' .. tostring(src) .. ':30120' end
+        return nil
+    end
+    GetPlayerName = function(src)
+        if connected[tostring(src)] then return 'p' .. tostring(src) end
+        return nil
+    end
+    Wait = function() coroutine.yield() end
+    local printed = {}
+    local realPrint = print
+    print = function(...)
+        local parts = {}
+        for i = 1, select('#', ...) do parts[i] = tostring(select(i, ...)) end
+        printed[#printed + 1] = table.concat(parts, ' ')
+    end
+    local ok, err = pcall(function()
+        local cos = {}
+        local function step()
+            for _, co in ipairs(cos) do
+                if coroutine.status(co) == 'suspended' then
+                    local resumed, resumeErr = coroutine.resume(co)
+                    assertTrue(resumed, tostring(resumeErr))
+                end
+            end
+        end
+        local doneCalls, states = {}, {}
+        for src = 1, 3 do
+            local key = tostring(src)
+            doneCalls[key] = 0
+            source = src
+            local co = coroutine.create(function()
+                env.handlers.playerConnecting('p' .. key, nil, {
+                    defer = function() end,
+                    update = function() end,
+                    presentCard = function() end,
+                    done = function()
+                        doneCalls[key] = doneCalls[key] + 1
+                        if key == '1' then error('injected done failure') end
+                    end,
+                })
+            end)
+            cos[#cos + 1] = co
+            local resumed, resumeErr = coroutine.resume(co)
+            assertTrue(resumed, tostring(resumeErr))
+        end
+        for _ = 1, 10 do step() end
+
+        -- Players 1 and 2 vanish; player 3 stays connected for now.
+        connected = { ['3'] = true }
+        local sweep = coroutine.create(env.threads[2])
+        cos[#cos + 1] = sweep
+        step()
+        step()
+        gameMs = gameMs + 3600 * 1000
+        for _ = 1, 40 do step() end
+        assertEqual(doneCalls['1'], 1, 'the failing deferral was attempted once')
+        assertEqual(doneCalls['2'], 1, 'the other abandoned deferral is finished despite the failure')
+        assertEqual(doneCalls['3'], 0, 'a connected player is untouched')
+        assertEqual(coroutine.status(sweep), 'suspended', 'the presence thread keeps running after a failed rejection')
+        local sawFailure = false
+        for _, line in ipairs(printed) do
+            if line:find('Failed to reject a deferral', 1, true) then sawFailure = true end
+            assertNotContains(line, 'Presence sweep failed', 'a failing rejection is isolated, not a sweep failure')
+        end
+        assertTrue(sawFailure, 'the failed rejection is logged')
+
+        -- Player 3 vanishes; stop the resource while the sweep is parked
+        -- mid-rejection (its claim is pending). The stop handler must finish it.
+        connected = {}
+        step() -- marks missing
+        gameMs = gameMs + 3600 * 1000
+        step() -- removes + claims, then yields inside the rejection
+        assertEqual(doneCalls['3'], 0, 'the claim is still pending at this point')
+        env.handlers.onResourceStop('lavender-test')
+        assertEqual(doneCalls['3'], 1, 'resource stop finishes a pending sweep claim')
+        for _ = 1, 10 do step() end
+        assertEqual(doneCalls['3'], 1, 'the parked rejection does not finish it a second time')
+    end)
+    print = realPrint
+    assertTrue(ok, tostring(err))
+end)
+
+test('presence sweep thread survives an iteration failure', function()
+    local env = loadEntrypoint('true')
+    local originalSweep = Lavender.__sweepOnce
+    local calls = 0
+    Lavender.__sweepOnce = function()
+        calls = calls + 1
+        if calls == 1 then error('injected sweep failure') end
+        return originalSweep()
+    end
+    local waits = 0
+    Wait = function()
+        waits = waits + 1
+        if waits > 3 then error('STOP') end
+    end
+    local realPrint = print
+    local printed = {}
+    print = function(...) printed[#printed + 1] = table.concat({ ... }, ' ') end
+    local ok, err = pcall(env.threads[2])
+    print = realPrint
+    Lavender.__sweepOnce = originalSweep
+    assertTrue(not ok and tostring(err):find('STOP', 1, true) ~= nil, 'loop only ended by the harness sentinel: ' .. tostring(err))
+    assertEqual(calls, 3, 'the sweep kept running after the failure')
+    local sawLog = false
+    for _, line in ipairs(printed) do
+        if line:find('Presence sweep failed', 1, true) then sawLog = true end
+    end
+    assertTrue(sawLog, 'the sweep failure is logged with a traceback')
+end)
+
 dofile('tests/queue_scale.lua')(test, assertEqual, assertTrue)
 
 local passed = 0
