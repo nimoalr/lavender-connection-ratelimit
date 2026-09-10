@@ -258,4 +258,74 @@ return function(test, assertEqual, assertTrue)
         end
         assertEqual(q2:status().queueSize, 20, 'a cap of 0 disables the flood limit')
     end)
+    test('a scattered removal sweep compacts the queue in one pass and emits in queue order', function()
+        -- Removing every other entry with table.remove would shift the
+        -- survivors once per removal (quadratic). _removeMany compacts the
+        -- array once, whichever positions are removed.
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.queue.maxSize = 4096
+        config.queue.disconnectGraceSeconds = 0
+        config.release.burst = 0
+        config.release.maxInFlight = 0
+        local now = 0
+        local removedIds = {}
+        local q = Queue.new({ config = config, now = function() return now end,
+            onEvent = function(event, data) if event == 'removed' then removedIds[#removedIds + 1] = data.entry.id end end })
+        local entries = {}
+        for i = 1, 200 do
+            entries[i] = q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.' .. (i % 200 + 1), identitySet = identityFor('s' .. i), payload = {} })
+            assertTrue(entries[i])
+        end
+        q:tick()
+        local shifts = 0
+        local realRemove = table.remove
+        table.remove = function(...) shifts = shifts + 1; return realRemove(...) end
+        local removed = q:sweepPresence(function(sourceKey) return tonumber(sourceKey) % 2 == 0 end)
+        table.remove = realRemove
+        assertEqual(#removed, 100, 'every odd entry is removed')
+        assertEqual(shifts, 0, 'a batch removal must not shift the array once per entry')
+        assertEqual(#removedIds, 100)
+        for i = 1, 100 do
+            assertEqual(removedIds[i], entries[2 * i - 1].id, 'removed events follow queue order')
+            assertEqual(q:isQueued(entries[2 * i - 1].id), false)
+            assertEqual(q:isQueued(entries[2 * i].id), true)
+        end
+        assertEqual(q:status().queueSize, 100)
+        for i = 1, 100 do
+            assertEqual(q.entries[i], entries[2 * i], 'survivors keep their relative order')
+            assertEqual(q.entries[i].position, i, 'positions were reconciled once for the survivors')
+        end
+        assertEqual(q.entries[101], nil, 'the array tail is trimmed')
+        -- The freed source keys can enqueue again (index cleanup).
+        assertTrue(q:enqueue({ sourceKey = '1', ip = '198.51.100.250', identitySet = identityFor('s1'), payload = {} }))
+    end)
+
+    test('a single removal defers the queue-wide reconcile to the next tick', function()
+        -- A drop storm is a burst of single removals; each used to pay a full
+        -- reconcile. Like enqueue, removal now marks the queue dirty and the
+        -- ticker reconciles once per frame before any admission.
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.queue.maxSize = 4096
+        config.release.burst = 0
+        config.release.maxInFlight = 0
+        local now = 0
+        local q = Queue.new({ config = config, now = function() return now end })
+        for i = 1, 100 do
+            assertTrue(q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.' .. (i % 200 + 1), identitySet = identityFor('d' .. i), payload = {} }))
+        end
+        q:tick()
+        local reconciles = 0
+        local original = q._reconcileDelays
+        q._reconcileDelays = function(self, ...) reconciles = reconciles + 1; return original(self, ...) end
+        for i = 1, 50 do
+            assertTrue(q:remove(tostring(i), 'disconnected'))
+        end
+        assertEqual(reconciles, 0, 'single removals must not reconcile inline')
+        assertTrue(q.dirty, 'removal marks the queue dirty')
+        assertEqual(q:size(), 50)
+        assertEqual(q:isQueued(1), false)
+        q:tick()
+        assertEqual(reconciles, 1, 'the next frame reconciles once for all 50 removals')
+        assertEqual(q.entries[1].position, 1, 'positions are refreshed by that reconcile')
+    end)
 end

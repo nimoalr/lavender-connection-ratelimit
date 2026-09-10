@@ -281,9 +281,12 @@ function Queue:_activeDuplicateInfo(candidate, now)
     end
 
     if best then
-        -- The reconcile pass caches each entry's wait estimate every frame;
-        -- use it rather than the O(n) live scan, falling back only for an entry
-        -- enqueued in this same frame (not yet reconciled).
+        -- The reconcile pass caches each entry's wait estimate whenever the
+        -- queue changes (it is dirty-gated, so a quiet queue keeps the last
+        -- one); use it rather than the O(n) live scan, falling back only for an
+        -- entry enqueued since the last reconcile. The ticker reconciles before
+        -- any admission, so this only shapes the reported wait, never who is
+        -- admitted.
         local estimate = best.estimatedWait
         if estimate == nil then
             estimate = self:estimateWait(best)
@@ -541,6 +544,16 @@ function Queue:enqueue(candidate)
     return entry
 end
 
+--- _unindex drops an entry from the lookup structures (id, source key,
+--- identity index) without touching the dense array.
+function Queue:_unindex(entry)
+    self.entriesById[entry.id] = nil
+    if self.entriesBySourceKey[entry.sourceKey] == entry then
+        self.entriesBySourceKey[entry.sourceKey] = nil
+    end
+    self.queuedIndex:remove(entry, entry.identitySet)
+end
+
 --- _detach removes the entry at index from the queue structures WITHOUT
 --- reconciling or emitting; callers batch those steps.
 function Queue:_detach(index)
@@ -548,11 +561,7 @@ function Queue:_detach(index)
     if not entry then
         return nil
     end
-    self.entriesById[entry.id] = nil
-    if self.entriesBySourceKey[entry.sourceKey] == entry then
-        self.entriesBySourceKey[entry.sourceKey] = nil
-    end
-    self.queuedIndex:remove(entry, entry.identitySet)
+    self:_unindex(entry)
     return entry
 end
 
@@ -568,27 +577,48 @@ function Queue:_indexOfEntry(entry)
     return nil
 end
 
+--- _removeAt detaches one entry and defers the queue-wide refresh to the next
+--- tick (dirty flag), exactly as enqueue does: a burst of single removals (a
+--- drop storm) then costs one array shift each and ONE reconcile per frame,
+--- not one full pass per removal. The ticker reconciles before any admission.
 function Queue:_removeAt(index, reason)
     local entry = self:_detach(index)
     if not entry then
         return nil
     end
 
-    self:reconcile()
+    self.dirty = true
     self:_emit('removed', { entry = entry, reason = reason })
     return entry
 end
 
---- _removeMany detaches the entries at the given DESCENDING indices, reconciles
---- once, then emits one 'removed' event per entry in that order (the order the
---- original produced by removing one at a time from the back).
-function Queue:_removeMany(indicesDescending, reason)
+--- _removeMany removes the entries at the given indices (any order) in ONE
+--- compaction pass over the array, so the cost is O(n) whichever positions are
+--- removed (removing them one by one with table.remove would shift the
+--- survivors once per removal). It then reconciles once and emits one
+--- 'removed' event per entry in ascending queue order, the order the entries
+--- stood in the queue.
+function Queue:_removeMany(indices, reason)
+    local drop = {}
+    for i = 1, #indices do
+        drop[indices[i]] = true
+    end
+    local entries = self.entries
+    local n = #entries
     local removed = {}
-    for i = 1, #indicesDescending do
-        local entry = self:_detach(indicesDescending[i])
-        if entry then
+    local write = 0
+    for i = 1, n do
+        local entry = entries[i]
+        if drop[i] then
+            self:_unindex(entry)
             removed[#removed + 1] = entry
+        else
+            write = write + 1
+            entries[write] = entry
         end
+    end
+    for i = write + 1, n do
+        entries[i] = nil
     end
     if #removed > 0 then
         self:reconcile()
@@ -626,8 +656,8 @@ end
 --- removed entries (each also emitted as a 'removed' event, as before).
 function Queue:sweepPresence(presentFn)
     local now = self.now()
-    local toRemove = {} -- descending indices, the order _removeMany expects
-    for i = #self.entries, 1, -1 do
+    local toRemove = {}
+    for i = 1, #self.entries do
         local entry = self.entries[i]
         if presentFn(entry.sourceKey) then
             entry.missingSince = nil

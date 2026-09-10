@@ -7,7 +7,10 @@
 -- harness measures the two synchronous hot paths as the backlog grows:
 --   * enqueue + wait-estimate  (what onPlayerConnecting runs per arrival)
 --   * tick()                   (what runTicker runs every 100 ms)
--- and projects the worst single-frame stall a real svMain frame would take.
+-- and projects the per-frame stall a real svMain frame would take from the
+-- AVERAGE costs (the max dirty tick is reported separately; time is frozen,
+-- admissions are disabled and callbacks are empty, so native work, deferral
+-- traffic and the presence sweep are NOT included).
 --
 -- The queue/identity libraries load from LIB_DIR (arg[1] or LAVENDER_LIB_DIR,
 -- default 'server/lib'), so the SAME harness runs the current code and a
@@ -86,12 +89,26 @@ local q = Queue.new({ now = function() return now end, config = config, onEvent 
 q:fillBucket()
 
 -- A coarse OS clock (Windows os.clock is ~1 ms) is made usable by timing a
--- batch of identical operations and dividing.
-local function timeAvg(iters, fn)
+-- batch of identical operations and dividing: with 20 iterations the average
+-- resolves to ~0.05 ms, so trailing decimals are not significant. The max is
+-- per iteration and therefore only meaningful above the clock granularity.
+-- GC is collected before each batch; allocation-triggered GC inside a batch is
+-- part of the measured cost, as it is in production.
+local function timeStats(iters, fn)
     collectgarbage('collect')
-    local t0 = os.clock()
-    for _ = 1, iters do fn() end
-    return (os.clock() - t0) * 1000 / iters -- ms per op
+    local total, worst = 0, 0
+    for _ = 1, iters do
+        local t0 = os.clock()
+        fn()
+        local dt = os.clock() - t0
+        total = total + dt
+        if dt > worst then worst = dt end
+    end
+    return total * 1000 / iters, worst * 1000 -- avg ms per op, max ms
+end
+local function timeAvg(iters, fn)
+    local avg = timeStats(iters, fn)
+    return avg
 end
 
 local TICK_ITERS = math.floor(envnum('STORM_TICK_ITERS', 20))
@@ -108,6 +125,7 @@ for _, target in ipairs(checkpoints) do
     local addFrom = next_i
     local size = 0
     if q.size then size = q:size() else size = q:status().queueSize end
+    collectgarbage('collect')
     local t0 = os.clock()
     while size < target and next_i <= PLAYERS do
         if q:enqueue(arrivals[next_i]) then size = size + 1 end
@@ -119,9 +137,17 @@ for _, target in ipairs(checkpoints) do
     -- The DIRTY tick is the one that matters: with a dirty-gated reconcile only
     -- the first tick after a change pays the O(n) pass, so averaging it with
     -- clean ticks would understate the frame cost 20x. Force the flag before
-    -- every timed tick (a no-op on code without the flag, which reconciles on
-    -- every tick anyway) and report the clean tick separately.
-    local tick_ms = timeAvg(TICK_ITERS, function()
+    -- every timed tick and report the clean tick separately. The flag is an
+    -- implementation field, set here because the harness must reproduce "a
+    -- change happened this frame" without paying an enqueue inside the timed
+    -- region; it reaches the same reconcile branch an enqueue does.
+    --
+    -- Code WITHOUT the flag (the pre-fix baseline) reconciles inside every
+    -- enqueue and, in tick, only after an admission. With admission frozen its
+    -- tick column therefore contains NO reconcile: compare the baseline on its
+    -- enqueue_ms (where its reconcile is paid) and on the projected frame, not
+    -- on the tick columns.
+    local tick_ms, tick_max_ms = timeStats(TICK_ITERS, function()
         if q.dirty ~= nil then q.dirty = true end
         q:tick()
     end)
@@ -137,27 +163,35 @@ for _, target in ipairs(checkpoints) do
             return function() k = (k % #ids) + 1; q:getPosition(ids[k]) end
         end)())
     end
-    rows[#rows + 1] = { size = size, enq_ms = enq_ms, tick_ms = tick_ms, clean_ms = clean_ms, pos_ms = pos_ms }
+    rows[#rows + 1] = { size = size, enq_ms = enq_ms, tick_ms = tick_ms, tick_max_ms = tick_max_ms, clean_ms = clean_ms, pos_ms = pos_ms }
     if size < target then break end -- PLAYERS exhausted
 end
 
 -- Frame projection: in one 100 ms server frame, ARRIVAL_PER_SEC/10 clients
--- arrive (each an enqueue) and the ticker runs once, all synchronous. Use the
--- costs measured at the largest backlog reached.
+-- arrive (each an enqueue) and the ticker runs once, all synchronous. Uses the
+-- AVERAGE costs measured at the largest backlog reached; it is a projection,
+-- not a measured worst case (see tick_max_ms for the largest single tick).
 local last = rows[#rows]
 local perFrame = math.max(1, math.floor(ARRIVAL_PER_SEC * FRAME_SECONDS))
-local worst_frame_ms = last and (perFrame * last.enq_ms + last.tick_ms) or 0
+local frame_ms = last and (perFrame * last.enq_ms + last.tick_ms) or 0
+local hasDirtyFlag = q.dirty ~= nil
 
 io.write('\n== connecting-storm result ==\n')
 io.write(('lib_dir          %s\n'):format(libDir))
 io.write(('backlog grown to %d  (dup fraction %.2f)\n'):format(last and last.size or 0, DUP_FRACTION))
-io.write('\ncost as the backlog grows (per-operation, admission frozen):\n')
-io.write('  queue_size   enqueue_ms   dirty_tick_ms   clean_tick_ms   getPosition_ms\n')
+io.write('\ncost as the backlog grows (per-operation averages, admission frozen; ~0.05 ms resolution):\n')
+io.write('  queue_size   enqueue_ms   dirty_tick_ms   tick_max_ms   clean_tick_ms   getPosition_ms\n')
 for _, r in ipairs(rows) do
-    io.write(('  %9d   %10.4f   %13.4f   %13.4f   %14.4f\n'):format(r.size, r.enq_ms, r.tick_ms, r.clean_ms, r.pos_ms))
+    io.write(('  %9d   %10.3f   %13.2f   %11.2f   %13.2f   %14.3f\n'):format(r.size, r.enq_ms, r.tick_ms, r.tick_max_ms, r.clean_ms, r.pos_ms))
 end
-io.write('\nprojected worst single-frame stall (one 100ms frame at peak backlog, dirty tick):\n')
-io.write(('  %d arrivals/frame x %.4f ms enqueue  +  %.4f ms dirty tick  =  %.1f ms\n'):format(
-    perFrame, last and last.enq_ms or 0, last and last.tick_ms or 0, worst_frame_ms))
-io.write(('\nSUMMARY lib=%s backlog=%d enqueue_ms=%.4f dirty_tick_ms=%.4f clean_tick_ms=%.4f worst_frame_ms=%.1f\n'):format(
-    libDir, last and last.size or 0, last and last.enq_ms or 0, last and last.tick_ms or 0, last and last.clean_ms or 0, worst_frame_ms))
+io.write('  enqueue_ms is per arrival (accepted or rejected), the cost onPlayerConnecting pays synchronously.\n')
+if not hasDirtyFlag then
+    io.write('  NOTE: this queue has no dirty flag (pre-fix baseline): it reconciles inside enqueue and, in tick,\n')
+    io.write('  only after an admission. Its tick columns contain no reconcile; compare enqueue_ms and the frame.\n')
+end
+io.write('\nprojected frame stall from the averages (one 100ms frame at peak backlog, one dirty tick):\n')
+io.write(('  %d arrivals/frame x %.3f ms enqueue  +  %.2f ms dirty tick  =  %.1f ms   (largest single tick seen: %.2f ms)\n'):format(
+    perFrame, last and last.enq_ms or 0, last and last.tick_ms or 0, frame_ms, last and last.tick_max_ms or 0))
+io.write(('\nSUMMARY lib=%s backlog=%d enqueue_ms=%.4f dirty_tick_ms=%.4f tick_max_ms=%.4f clean_tick_ms=%.4f frame_ms=%.1f dirty_flag=%s\n'):format(
+    libDir, last and last.size or 0, last and last.enq_ms or 0, last and last.tick_ms or 0, last and last.tick_max_ms or 0,
+    last and last.clean_ms or 0, frame_ms, tostring(hasDirtyFlag)))

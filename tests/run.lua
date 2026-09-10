@@ -264,6 +264,10 @@ test('active duplicate delays recalculate when matching queued attempts are remo
     assertEqual(Util.round(remaining), 120)
 
     assertEqual(queue:remove('a', 'disconnected').sourceKey, 'a')
+    -- Like enqueue, a removal marks the queue dirty and the ticker reconciles
+    -- once per frame before any admission; the explicit reconcile stands in
+    -- for that frame here.
+    queue:reconcile()
 
     reason, remaining = queue:getEntryReason(second)
     assertEqual(reason, 'ready')
@@ -274,6 +278,7 @@ test('active duplicate delays recalculate when matching queued attempts are remo
     assertEqual(Util.round(remaining), 60)
 
     assertEqual(queue:remove('second-source', 'disconnected').sourceKey, 'second-source')
+    queue:reconcile()
     reason, remaining = queue:getEntryReason(third)
     assertEqual(reason, 'ready')
     assertEqual(Util.round(remaining), 0)
@@ -396,6 +401,10 @@ test('IP pacing delays recalculate when queued attempts are removed', function()
     assertEqual(Util.round(remaining), 120)
 
     assertEqual(queue:remove('a', 'disconnected').sourceKey, 'a')
+    -- Like enqueue, a removal marks the queue dirty and the ticker reconciles
+    -- once per frame before any admission; the explicit reconcile stands in
+    -- for that frame here.
+    queue:reconcile()
 
     reason, remaining = queue:getEntryReason(second)
     assertEqual(reason, 'ready')
@@ -1085,6 +1094,97 @@ test('password gate rejections are counted by disconnected reason', function()
 end)
 
 -- Queue observer isolation and scaling tests.
+
+test('presence sweep completes every abandoned deferral even when waiters wake mid-rejection', function()
+    -- Rejecting a deferral yields (FXServer needs a tick between deferral
+    -- calls). A queued connection's waiter that runs during that yield finds
+    -- its entry already removed by the batch sweep; if it marks the state
+    -- closed, the sweep's own rejection of that entry is skipped and the
+    -- client is left hanging on an open deferral. Drive the real handler, the
+    -- real presence thread and the real waiters as coroutines with a
+    -- round-robin scheduler so the interleaving is exact.
+    local env = loadEntrypoint('true')
+    local gameMs = 0
+    GetGameTimer = function() return gameMs end
+    local connected = { ['1'] = true, ['2'] = true, ['3'] = true }
+    GetPlayerIdentifiers = function(src)
+        if connected[tostring(src)] then return { 'license:race-' .. tostring(src) } end
+        return {}
+    end
+    GetNumPlayerTokens = function() return 0 end
+    GetPlayerEndpoint = function(src)
+        if connected[tostring(src)] then return '198.51.100.' .. tostring(src) .. ':30120' end
+        return nil
+    end
+    GetPlayerName = function(src)
+        if connected[tostring(src)] then return 'p' .. tostring(src) end
+        return nil
+    end
+    Wait = function() coroutine.yield() end
+
+    local printed = {}
+    local realPrint = print
+    print = function(...)
+        local parts = {}
+        for i = 1, select('#', ...) do parts[i] = tostring(select(i, ...)) end
+        printed[#printed + 1] = table.concat(parts, ' ')
+    end
+    local ok, err = pcall(function()
+        local cos = {}
+        local function step()
+            for _, co in ipairs(cos) do
+                if coroutine.status(co) == 'suspended' then
+                    local resumed, resumeErr = coroutine.resume(co)
+                    assertTrue(resumed, tostring(resumeErr))
+                end
+            end
+        end
+        local doneCalls = {}
+        for src = 1, 3 do
+            local key = tostring(src)
+            doneCalls[key] = 0
+            source = src
+            local co = coroutine.create(function()
+                env.handlers.playerConnecting('p' .. key, nil, {
+                    defer = function() end,
+                    update = function() end,
+                    presentCard = function() end,
+                    done = function() doneCalls[key] = doneCalls[key] + 1 end,
+                })
+            end)
+            cos[#cos + 1] = co
+            local resumed, resumeErr = coroutine.resume(co) -- reads `source` before its first yield
+            assertTrue(resumed, tostring(resumeErr))
+        end
+        for _ = 1, 10 do step() end
+        local queued = 0
+        for _, line in ipairs(printed) do
+            if line:find('Queued connection', 1, true) then queued = queued + 1 end
+        end
+        assertEqual(queued, 3, 'all three connections are queued (the ticker is not running)')
+
+        -- Everyone vanishes. The presence thread marks them missing on one
+        -- pass and removes them all on the next, past the disconnect grace.
+        connected = {}
+        local sweep = coroutine.create(env.threads[2])
+        cos[#cos + 1] = sweep
+        step()               -- presence thread parks at its Wait(1000)
+        step()               -- first sweep: marked missing, inside the grace
+        gameMs = gameMs + 3600 * 1000
+        for _ = 1, 40 do step() end -- second sweep removes all three and rejects them, yielding between calls
+
+        for src = 1, 3 do
+            assertEqual(doneCalls[tostring(src)], 1, ('abandoned connection %d must have its deferral finished exactly once'):format(src))
+        end
+        for _, line in ipairs(printed) do
+            assertNotContains(line, 'Failed to reject', 'no rejection may fail on a closed deferral')
+        end
+        assertEqual(coroutine.status(sweep), 'suspended', 'the presence thread keeps running')
+    end)
+    print = realPrint
+    assertTrue(ok, tostring(err))
+end)
+
 dofile('tests/queue_scale.lua')(test, assertEqual, assertTrue)
 
 local passed = 0

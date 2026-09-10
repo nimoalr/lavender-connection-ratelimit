@@ -370,7 +370,12 @@ local function waitForEntryDecision(entry, state)
         end
 
         if not queue:isQueued(entry.id) then
-            state.closed = true
+            -- The presence sweep claims the deferrals it removed before it
+            -- yields and rejects them itself; closing one here would skip that
+            -- rejection and leave the client hanging on an open deferral.
+            if not state.claimedBySweep then
+                state.closed = true
+            end
             return
         end
 
@@ -573,17 +578,27 @@ CreateThread(function()
         -- One pass over the queue and ONE reconcile for every abandoned entry
         -- removed, so a mass disconnect costs O(n), not a reconcile per player.
         local removedEntries = queue:sweepPresence(sourceStillConnected)
+        -- Claim every deferral BEFORE the first yield: rejecting one yields,
+        -- and a waiter that wakes meanwhile finds its entry gone and would mark
+        -- its state closed, which would skip the rejection here and never
+        -- finish the deferral.
+        local toReject = {}
         for i = 1, #removedEntries do
             local removed = removedEntries[i]
-            if removed.payload and removed.payload.deferral then
+            local state = removed.payload and removed.payload.deferral
+            if state then
                 log(('Removed abandoned queued connection: entry=%d queue=%d'):format(
                     removed.id,
                     queue:size()
                 ))
-                if not removed.payload.deferral.closed then
-                    rejectDeferral(removed.payload.deferral, activeConfig.messages.disconnected, 'disconnected')
+                if not state.closed then
+                    state.claimedBySweep = true
+                    toReject[#toReject + 1] = state
                 end
             end
+        end
+        for i = 1, #toReject do
+            rejectDeferral(toReject[i], activeConfig.messages.disconnected, 'disconnected')
         end
         metrics:recordPresenceSweep(os.clock() - sweepStart, #removedEntries)
     end

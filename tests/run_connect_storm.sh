@@ -2,6 +2,9 @@
 # Drives tests/connect_storm.lua against the current queue and the pre-fix queue
 # (the initial commit, before the bounded-reconciliation rewrite) and prints both,
 # so the mass-reconnect main-thread stall can be reproduced and the fix verified.
+# The baseline has no dirty flag: it reconciles inside every enqueue, so its
+# enqueue_ms and projected frame are the comparable numbers (its tick columns
+# contain no reconcile while admission is frozen; the harness prints a note).
 #
 # Usage: sh tests/run_connect_storm.sh [PLAYERS]
 #   env passthrough: STORM_DUP_FRACTION, STORM_ARRIVAL_PER_SEC, STORM_ADMIT_PER_SEC
