@@ -19,9 +19,10 @@ local Util = Lavender.Util
       * One reconciliation pass computes each entry's wait estimate for later
         duplicates in O(log n) using a sorted prefix of eligibility times, instead
         of an O(n) rescan per duplicate.
-      * Batch expiry and drain remove every affected entry first and reconcile
-        ONCE, instead of reconciling after each single removal (which is cubic in
-        the batch size).
+      * Batch removals (expiry, drain, the presence sweep) take every affected
+        entry out in ONE compaction pass and refresh estimates once; a single
+        removal marks the queue dirty and the next frame's pass refreshes it.
+        Estimates are never refreshed once per removed entry.
       * Observer callbacks (onEvent) are isolated: an exception in a metrics
         callback cannot abort a state transition half-way or kill the caller's
         ticker. Failures are counted, never swallowed silently.
@@ -595,10 +596,11 @@ end
 --- _removeMany removes the entries at the given indices (any order) in ONE
 --- compaction pass over the array, so the cost is O(n) whichever positions are
 --- removed (removing them one by one with table.remove would shift the
---- survivors once per removal). It then reconciles once and emits one
---- 'removed' event per entry in ascending queue order, the order the entries
---- stood in the queue.
-function Queue:_removeMany(indices, reason)
+--- survivors once per removal). It then refreshes estimates once (or, when
+--- deferReconcile is set, leaves that to the caller's own pass by marking the
+--- queue dirty) and emits one 'removed' event per entry in ascending queue
+--- order, the order the entries stood in the queue.
+function Queue:_removeMany(indices, reason, deferReconcile)
     local drop = {}
     for i = 1, #indices do
         drop[indices[i]] = true
@@ -621,7 +623,11 @@ function Queue:_removeMany(indices, reason)
         entries[i] = nil
     end
     if #removed > 0 then
-        self:reconcile()
+        if deferReconcile then
+            self.dirty = true
+        else
+            self:reconcile()
+        end
         for i = 1, #removed do
             self:_emit('removed', { entry = removed[i], reason = reason })
         end
@@ -715,7 +721,8 @@ function Queue:_expireQueue(now, results)
     if #expired == 0 then
         return
     end
-    local removed = self:_removeMany(expired, 'queue_timeout')
+    -- tick() reconciles right after expiry; do not pay a second pass here.
+    local removed = self:_removeMany(expired, 'queue_timeout', true)
     for i = 1, #removed do
         results.queueTimeouts[#results.queueTimeouts + 1] = removed[i]
     end
@@ -794,10 +801,11 @@ function Queue:tick()
     self:_expireQueue(now, results)
     self:_expireInFlight(now, results)
 
-    -- Expiry changed membership, so estimates need refreshing before we decide
-    -- who to admit. Reconcile once here, gated on dirty, using fresh values for
-    -- every admission decision this frame.
-    if #results.queueTimeouts > 0 or #results.inFlightTimeouts > 0 then
+    -- Expiry changed membership (queue expiry marked the queue dirty; in-flight
+    -- expiry changes the pacing inputs), so estimates need refreshing before
+    -- we decide who to admit. Reconcile once here, gated on dirty, using fresh
+    -- values for every admission decision this frame.
+    if #results.inFlightTimeouts > 0 then
         self.dirty = true
     end
     results.reconcileSeconds = 0
@@ -842,8 +850,8 @@ function Queue:tick()
 
     -- Admissions removed entries and added recent-admission records, so the
     -- remaining entries' estimates are stale; mark dirty and let the next
-    -- frame reconcile (or an explicit reconcile() caller). This keeps the pass
-    -- to at most once per frame.
+    -- frame reconcile (or an explicit reconcile() caller). Together with the
+    -- deferred expiry refresh above, tick() runs the pass at most once.
     if #results.admitted > 0 then
         self.dirty = true
     end

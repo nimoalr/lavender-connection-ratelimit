@@ -521,6 +521,26 @@ test('deferral serializer waits a tick before every operation', function()
     assertTrue(source:find('queue:updateInFlightPresence', 1, true) == nil, 'in-flight entries must be cleared by playerJoining or timeout')
 end)
 
+test('deferral serializer refuses an operation whose state was closed during its spacing wait', function()
+    -- Another owner (resource stop) can finish the deferral while an operation
+    -- is parked in the one-tick spacing wait; the parked operation must then
+    -- not run, or done() would be called twice on the same client.
+    local calls = 0
+    local object = { update = function() calls = calls + 1 end, done = function() calls = calls + 1 end }
+    local state = Deferral.new(object, function() coroutine.yield() end)
+    local co = coroutine.create(function() return Deferral.call(state, 'done') end)
+    assertTrue(coroutine.resume(co)) -- parked in the spacing wait
+    assertEqual(coroutine.status(co), 'suspended')
+    assertEqual(calls, 0)
+    state.closed = true -- finished elsewhere
+    local ok, result, err = coroutine.resume(co)
+    assertTrue(ok)
+    assertEqual(result, false)
+    assertEqual(err, 'deferral is closed')
+    assertEqual(calls, 0, 'the parked operation must not run on a closed deferral')
+    assertEqual(state.busy, false, 'the serializer releases the state')
+end)
+
 test('FX deferral wrapper uses direct methods and supports callable members', function()
     local tick = 0
     local actions = {}
@@ -1186,12 +1206,14 @@ test('presence sweep completes every abandoned deferral even when waiters wake m
 end)
 
 
-test('presence sweep survives a failing rejection and resource stop finishes its pending claims', function()
-    -- Same coroutine scheduler as the test above. Player 1's deferral throws
-    -- on done(): that rejection must not abort the sweep or leave the state
-    -- open, and player 2 must still be finished. Then, with a claim parked
-    -- mid-rejection, resource stop must finish it rather than leave the
-    -- client waiting on a deferral nobody owns.
+-- Drives the real handler, presence thread and waiters as coroutines with a
+-- round-robin scheduler. Player 1's deferral throws on done(): that rejection
+-- must not abort the sweep or leave the state open, and player 2 must still be
+-- finished. Then player 3 is abandoned and the resource is stopped while the
+-- sweep's rejection of it is parked; parkSteps chooses WHERE it is parked (0:
+-- in the spacing wait before update(), 2: in the spacing wait before done()).
+-- Resource stop must finish that claim exactly once either way.
+local function runSweepStopScenario(parkSteps)
     local env = loadEntrypoint('true')
     local gameMs = 0
     GetGameTimer = function() return gameMs end
@@ -1227,7 +1249,7 @@ test('presence sweep survives a failing rejection and resource stop finishes its
                 end
             end
         end
-        local doneCalls, states = {}, {}
+        local doneCalls = {}
         for src = 1, 3 do
             local key = tostring(src)
             doneCalls[key] = 0
@@ -1273,15 +1295,24 @@ test('presence sweep survives a failing rejection and resource stop finishes its
         connected = {}
         step() -- marks missing
         gameMs = gameMs + 3600 * 1000
-        step() -- removes + claims, then yields inside the rejection
+        step() -- removes + claims, then parks in the spacing wait before update()
+        for _ = 1, parkSteps do step() end -- optionally advance to the wait before done()
         assertEqual(doneCalls['3'], 0, 'the claim is still pending at this point')
         env.handlers.onResourceStop('lavender-test')
         assertEqual(doneCalls['3'], 1, 'resource stop finishes a pending sweep claim')
         for _ = 1, 10 do step() end
-        assertEqual(doneCalls['3'], 1, 'the parked rejection does not finish it a second time')
+        assertEqual(doneCalls['3'], 1, ('the rejection parked %d steps in does not finish it a second time'):format(parkSteps))
     end)
     print = realPrint
     assertTrue(ok, tostring(err))
+end
+
+test('presence sweep survives a failing rejection and resource stop finishes its pending claims', function()
+    runSweepStopScenario(0)
+end)
+
+test('a rejection parked before done() does not finish a deferral resource stop already finished', function()
+    runSweepStopScenario(2)
 end)
 
 test('presence sweep thread survives an iteration failure', function()

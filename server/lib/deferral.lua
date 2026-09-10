@@ -55,6 +55,13 @@ function Deferral.call(state, method, ...)
     -- FXServer requires at least one tick between all deferral operations.
     state.wait(0)
 
+    -- Closed while we waited (another owner finished it, e.g. resource stop):
+    -- the operation must not run on a finished deferral.
+    if state.closed then
+        state.busy = false
+        return false, 'deferral is closed'
+    end
+
     local fn = state.object[method]
     local ok, err
     if fn == nil then

@@ -328,4 +328,31 @@ return function(test, assertEqual, assertTrue)
         assertEqual(reconciles, 1, 'the next frame reconciles once for all 50 removals')
         assertEqual(q.entries[1].position, 1, 'positions are refreshed by that reconcile')
     end)
+    test('a tick that expires entries runs the queue-wide refresh once', function()
+        local config = Util.deepCopy(Lavender.Defaults)
+        config.queue.maxSize = 4096
+        config.queue.maxWaitSeconds = 10
+        config.release.burst = 0
+        config.release.maxInFlight = 0
+        local now = 0
+        local q = Queue.new({ config = config, now = function() return now end })
+        for i = 1, 100 do
+            assertTrue(q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.' .. (i % 200 + 1), identitySet = identityFor('x' .. i), payload = {} }))
+        end
+        q:tick()
+        now = 5
+        for i = 101, 150 do
+            assertTrue(q:enqueue({ sourceKey = tostring(i), ip = '198.51.100.' .. (i % 200 + 1), identitySet = identityFor('x' .. i), payload = {} }))
+        end
+        q:tick()
+        local reconciles = 0
+        local original = q._reconcileDelays
+        q._reconcileDelays = function(self, ...) reconciles = reconciles + 1; return original(self, ...) end
+        now = 12 -- the first 100 expire, the later 50 stay
+        local results = q:tick()
+        assertEqual(#results.queueTimeouts, 100)
+        assertEqual(q:size(), 50)
+        assertEqual(reconciles, 1, 'expiry plus the admission pass refresh estimates exactly once')
+        assertEqual(q.entries[1].position, 1, 'survivors were refreshed before admission decisions')
+    end)
 end
