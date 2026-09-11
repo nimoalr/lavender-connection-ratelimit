@@ -229,9 +229,17 @@ local rejectionMessages = {
     end,
 }
 
+-- Every deferral this resource has opened and not yet finished, whatever
+-- path it is on (queued and waiting, timed out and awaiting its waiter,
+-- removed by the presence sweep). Resource stop finishes all of them, so no
+-- client is left on an open deferral because its owner never got to run.
+local openDeferrals = {}
+
 local function rejectDeferral(state, message, reason)
     local ok, err = Deferral.reject(state, message)
-    if not ok then
+    if not ok and err ~= 'deferral is closed' then
+        -- 'deferral is closed' means another owner (resource stop, a drop)
+        -- already finished it: nothing failed.
         log(('Failed to reject a deferral: reason=%s error=%s'):format(
             tostring(reason or 'unknown'),
             tostring(err)
@@ -395,6 +403,7 @@ local function onPlayerConnecting(playerName, _, deferrals)
 
     local ok, err = xpcall(function()
         deferralState = Deferral.fromFx(deferrals, Wait)
+        openDeferrals[deferralState] = true
 
         deferrals.defer()
         Wait(0)
@@ -476,6 +485,11 @@ local function onPlayerConnecting(playerName, _, deferrals)
         if deferralState and not deferralState.closed then
             rejectDeferral(deferralState, activeConfig.messages.internalError, 'internal_error')
         end
+    end
+    -- Unregister only once recovery is complete: the rejection above yields,
+    -- and a resource stop during that yield must still find the deferral.
+    if deferralState then
+        openDeferrals[deferralState] = nil
     end
 end
 
@@ -855,6 +869,15 @@ AddEventHandler('onResourceStop', function(stoppedResource)
             state.closed = true
         end
         pendingSweepClaims[state] = nil
+    end
+    -- And every other deferral still open, whatever its path (a timed-out
+    -- entry whose waiter has not run yet, a handler parked mid-operation).
+    for state in pairs(openDeferrals) do
+        if not state.closed then
+            pcall(state.object.done, message)
+            state.closed = true
+        end
+        openDeferrals[state] = nil
     end
 end)
 

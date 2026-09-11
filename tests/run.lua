@@ -1211,8 +1211,9 @@ end)
 -- must not abort the sweep or leave the state open, and player 2 must still be
 -- finished. Then player 3 is abandoned and the resource is stopped while the
 -- sweep's rejection of it is parked; parkSteps chooses WHERE it is parked (0:
--- in the spacing wait before update(), 2: in the spacing wait before done()).
--- Resource stop must finish that claim exactly once either way.
+-- waiting for the state's busy flag while the waiter's own display update
+-- holds the spacing wait, 2: in the spacing wait before done()). Resource
+-- stop must finish that claim exactly once either way.
 local function runSweepStopScenario(parkSteps)
     local env = loadEntrypoint('true')
     local gameMs = 0
@@ -1289,19 +1290,23 @@ local function runSweepStopScenario(parkSteps)
             assertNotContains(line, 'Presence sweep failed', 'a failing rejection is isolated, not a sweep failure')
         end
         assertTrue(sawFailure, 'the failed rejection is logged')
+        local before = #printed
 
         -- Player 3 vanishes; stop the resource while the sweep is parked
         -- mid-rejection (its claim is pending). The stop handler must finish it.
         connected = {}
         step() -- marks missing
         gameMs = gameMs + 3600 * 1000
-        step() -- removes + claims, then parks in the spacing wait before update()
+        step() -- removes + claims, then parks (waiting on the busy flag)
         for _ = 1, parkSteps do step() end -- optionally advance to the wait before done()
         assertEqual(doneCalls['3'], 0, 'the claim is still pending at this point')
         env.handlers.onResourceStop('lavender-test')
         assertEqual(doneCalls['3'], 1, 'resource stop finishes a pending sweep claim')
         for _ = 1, 10 do step() end
         assertEqual(doneCalls['3'], 1, ('the rejection parked %d steps in does not finish it a second time'):format(parkSteps))
+        for i = before + 1, #printed do
+            assertNotContains(printed[i], 'Failed to reject', 'a rejection refused because stop already finished the deferral is not a failure')
+        end
     end)
     print = realPrint
     assertTrue(ok, tostring(err))
@@ -1313,6 +1318,125 @@ end)
 
 test('a rejection parked before done() does not finish a deferral resource stop already finished', function()
     runSweepStopScenario(2)
+end)
+
+
+test('resource stop finishes a timed-out deferral whose waiter has not run yet', function()
+    -- Queue timeout removes the entry inside the ticker and leaves the
+    -- rejection to the connection's own waiter. If the resource stops between
+    -- the two, nobody else owns that deferral: the stop handler must finish
+    -- it, and the waiter must not finish it again afterwards.
+    local env = loadEntrypoint('true')
+    local gameMs = 0
+    GetGameTimer = function() return gameMs end
+    GetPlayerIdentifiers = function() return { 'license:timeout-1' } end
+    GetNumPlayerTokens = function() return 0 end
+    GetPlayerEndpoint = function() return '198.51.100.1:30120' end
+    GetPlayerName = function() return 'p1' end
+    Wait = function() coroutine.yield() end
+    local realPrint = print
+    local printed = {}
+    print = function(...)
+        local parts = {}
+        for i = 1, select('#', ...) do parts[i] = tostring(select(i, ...)) end
+        printed[#printed + 1] = table.concat(parts, ' ')
+    end
+    local ok, err = pcall(function()
+        local doneCalls = 0
+        source = 1
+        local waiter = coroutine.create(function()
+            env.handlers.playerConnecting('p1', nil, {
+                defer = function() end,
+                update = function() end,
+                presentCard = function() end,
+                done = function() doneCalls = doneCalls + 1 end,
+            })
+        end)
+        assertTrue(coroutine.resume(waiter))
+        for _ = 1, 5 do
+            if coroutine.status(waiter) == 'suspended' then assertTrue(coroutine.resume(waiter)) end
+        end
+        local queued = false
+        for _, line in ipairs(printed) do
+            if line:find('Queued connection', 1, true) then queued = true end
+        end
+        assertTrue(queued, 'the connection is queued')
+
+        -- Far past the queue timeout: one ticker pass removes the entry and
+        -- posts the rejection for the waiter.
+        gameMs = gameMs + 7 * 24 * 3600 * 1000
+        local ticker = coroutine.create(env.threads[1])
+        assertTrue(coroutine.resume(ticker)) -- parks at Wait(100)
+        assertTrue(coroutine.resume(ticker)) -- runs the pass
+        assertEqual(doneCalls, 0, 'the waiter has not run yet')
+
+        env.handlers.onResourceStop('lavender-test')
+        assertEqual(doneCalls, 1, 'resource stop finishes the timed-out deferral')
+        for _ = 1, 10 do
+            if coroutine.status(waiter) == 'suspended' then assertTrue(coroutine.resume(waiter)) end
+        end
+        assertEqual(doneCalls, 1, 'the waiter does not finish it a second time')
+        for _, line in ipairs(printed) do
+            assertNotContains(line, 'Failed to reject', 'the refused late rejection is not logged as a failure')
+        end
+    end)
+    print = realPrint
+    assertTrue(ok, tostring(err))
+end)
+
+
+test('resource stop finishes a deferral whose handler failed and is parked in its error rejection', function()
+    -- The connect handler's own error path rejects the deferral, which
+    -- yields. A resource stop during that yield must still own the deferral
+    -- (it stays registered until recovery is complete), and the resumed
+    -- rejection must not finish it a second time.
+    local env = loadEntrypoint('true')
+    GetGameTimer = function() return 0 end
+    GetPlayerIdentifiers = function() return { 'license:boom-1' } end
+    GetNumPlayerTokens = function() return 0 end
+    GetPlayerEndpoint = function() return '198.51.100.1:30120' end
+    GetPlayerName = function() return 'p1' end
+    Wait = function() coroutine.yield() end
+    local realFromRaw = Lavender.Identity.fromRaw
+    Lavender.Identity.fromRaw = function() error('injected handler failure') end
+    local realPrint = print
+    local printed = {}
+    print = function(...)
+        local parts = {}
+        for i = 1, select('#', ...) do parts[i] = tostring(select(i, ...)) end
+        printed[#printed + 1] = table.concat(parts, ' ')
+    end
+    local ok, err = pcall(function()
+        local doneCalls = 0
+        source = 1
+        local handler = coroutine.create(function()
+            env.handlers.playerConnecting('p1', nil, {
+                defer = function() end,
+                update = function() end,
+                presentCard = function() end,
+                done = function() doneCalls = doneCalls + 1 end,
+            })
+        end)
+        assertTrue(coroutine.resume(handler)) -- defer, then Wait(0)
+        assertTrue(coroutine.resume(handler)) -- fails, enters the error rejection, parks in its spacing wait
+        assertEqual(coroutine.status(handler), 'suspended', 'the error rejection is parked')
+        assertEqual(doneCalls, 0)
+        local failed = false
+        for _, line in ipairs(printed) do
+            if line:find('Connection handler failed', 1, true) then failed = true end
+        end
+        assertTrue(failed, 'the handler failure is logged')
+
+        env.handlers.onResourceStop('lavender-test')
+        assertEqual(doneCalls, 1, 'resource stop finishes the deferral parked in error recovery')
+        for _ = 1, 10 do
+            if coroutine.status(handler) == 'suspended' then assertTrue(coroutine.resume(handler)) end
+        end
+        assertEqual(doneCalls, 1, 'the resumed error rejection does not finish it a second time')
+    end)
+    Lavender.Identity.fromRaw = realFromRaw
+    print = realPrint
+    assertTrue(ok, tostring(err))
 end)
 
 test('presence sweep thread survives an iteration failure', function()
